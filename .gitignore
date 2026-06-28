@@ -1,0 +1,32 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Trained model artifacts (large/binary, regenerate via src/models/*.py)
+models/*/_checkpoints/
+models/svm/*.pkl
+models/bilstm/*.pt
+models/bilstm/*.json
+models/codebert/
+
+# Generated dataset
+data/dataset.csv
+
+# Third-party PasteTrace release (IDE binaries + raw case-study dataset, too large for git)
+PasteTrace-release/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
