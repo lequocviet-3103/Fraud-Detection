@@ -1,0 +1,6 @@
+case,student,label,total_events,type_count,paste_count,paste_ratio,max_paste_length,external_paste,ext_paste_ratio,pasted_char_frac,ext_char_frac,typed_chars
+111,AA,1,71,68,3,0.042254,244,3,1.0,0.907859,0.907859,68
+111,BB,1,209,206,3,0.014354,132,2,0.666667,0.592885,0.490119,206
+111,CC,1,195,194,1,0.005128,297,1,1.0,0.604888,0.604888,194
+111,DD,0,897,897,0,0.0,0,0,0.0,0.0,0.0,897
+111,EE,0,315,312,3,0.009524,177,0,0.0,0.520737,0.0,312

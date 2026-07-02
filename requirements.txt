@@ -5,6 +5,9 @@ joblib
 torch
 transformers
 accelerate
+xgboost
+streamlit
+plotly
 fastapi
 uvicorn[standard]
 python-multipart
