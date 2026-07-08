@@ -1,0 +1,35 @@
+removing E:\Sketchbook\ExtraCreditICS211\ExtraCreditICS211.pde
+java.lang.Exception
+	at processing.app.ui.Recent.remove(Recent.java:246)
+	at processing.app.ui.Recent.append(Recent.java:294)
+	at processing.app.Base.handleOpen(Base.java:1367)
+	at processing.app.Base.handleOpen(Base.java:1314)
+	at processing.app.Base.handleOpen(Base.java:1303)
+	at processing.app.Base.<init>(Base.java:416)
+	at processing.app.Base.createAndShowGUI(Base.java:239)
+	at processing.app.Base.access$0(Base.java:151)
+	at processing.app.Base$1.run(Base.java:118)
+	at java.awt.event.InvocationEvent.dispatch(InvocationEvent.java:311)
+	at java.awt.EventQueue.dispatchEventImpl(EventQueue.java:758)
+	at java.awt.EventQueue.access$500(EventQueue.java:97)
+	at java.awt.EventQueue$3.run(EventQueue.java:709)
+	at java.awt.EventQueue$3.run(EventQueue.java:703)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at java.security.ProtectionDomain$JavaSecurityAccessImpl.doIntersectionPrivilege(ProtectionDomain.java:74)
+	at java.awt.EventQueue.dispatchEvent(EventQueue.java:728)
+	at java.awt.EventDispatchThread.pumpOneEventForFilters(EventDispatchThread.java:205)
+	at java.awt.EventDispatchThread.pumpEventsForFilter(EventDispatchThread.java:116)
+	at java.awt.EventDispatchThread.pumpEventsForHierarchy(EventDispatchThread.java:105)
+	at java.awt.EventDispatchThread.pumpEvents(EventDispatchThread.java:101)
+	at java.awt.EventDispatchThread.pumpEvents(EventDispatchThread.java:93)
+	at java.awt.EventDispatchThread.run(EventDispatchThread.java:82)
+
+
+
+
+
+
+
+
+
+

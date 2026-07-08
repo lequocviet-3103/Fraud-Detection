@@ -1,0 +1,6 @@
+Hello!
+
+To accomplish this assignment, I looked at the documentation of Processing 3 that was provided. I looked at the different functions and determined which ones would be useful to complete the tasks. I also looked at the examples provided with the application. Lastly, if any errors occured, I looked up the problems online to see what others have done to solve it. 
+
+Thank you, 
+From anonymous

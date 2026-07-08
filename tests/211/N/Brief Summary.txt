@@ -1,0 +1,8 @@
+Hello,
+
+I apologize if I did not do this assignment correctly. Upon watching the video provided and going through the references, it was really interesting and intriguing to do.
+
+I was trying to create our solar system (excluding the moon, as I was having trouble figuring that out). I used the perspective example through the reference to give the effect of a 'spinning' solar system and the zoom-ins & outs just added to my vision of how I wanted to do it. I also used the sphere function to create the planets.
+
+Thank you for the opportunity to do this assignment!
+- Student N.

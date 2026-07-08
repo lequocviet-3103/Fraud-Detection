@@ -1,0 +1,16 @@
+unexpected token: Color
+unexpected token: Color
+unexpected token: Color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+Illegal modifier for the local class ScreenSaver1; only abstract or final is permitted
+The type ScreenSaver1 must implement the inherited abstract method ActionListener.actionPerformed(ActionEvent)
+The type KeyEvent is ambiguous

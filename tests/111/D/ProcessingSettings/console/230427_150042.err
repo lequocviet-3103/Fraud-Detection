@@ -1,0 +1,71 @@
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'SEMI'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'SEMI'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+Found an extra { character without a } to match it.
+Found an extra { character without a } to match it.
+unexpected token: addRandomCircle
+Found an extra { character without a } to match it.
+Found an extra { character without a } to match it.
+Found an extra { character without a } to match it.
+Found an extra { character without a } to match it.
+Illegal modifier for the local class Circle; only abstract or final is permitted
+Illegal modifier for the local class Circle; only abstract or final is permitted
+Cannot find a class or type named “Shape”
+Cannot find a class or type named “Shape”
+expecting "class", found 'Circle'
+expecting "class", found 'Circle'
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+unexpected token: color
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
+expecting SEMI, found 'circle'
+Syntax error, maybe a missing semicolon?
