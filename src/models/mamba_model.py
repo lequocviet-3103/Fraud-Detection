@@ -96,6 +96,19 @@ class MambaClassifier(nn.Module):
 
 
 # ── Train one epoch ──────────────────────────────────────────────────────────
+def _accumulate_stats(logits, labels, stats, y_true, y_pred, y_prob):
+    l = logits.detach()
+    stats["min"] = min(stats["min"], float(l.min().item()))
+    stats["max"] = max(stats["max"], float(l.max().item()))
+    stats["sum_abs"] += float(l.abs().sum().item())
+    stats["count"] += int(l.numel())
+    probs = torch.sigmoid(logits).detach().cpu().numpy()
+    preds = (probs >= 0.5).astype(int)
+    y_true.extend(labels.cpu().numpy().tolist())
+    y_pred.extend(preds.tolist())
+    y_prob.extend(probs.tolist())
+
+
 def _run_epoch(model, loader, device, criterion=None, optimizer=None):
     training = criterion is not None and optimizer is not None
     model.train(training)
@@ -104,34 +117,35 @@ def _run_epoch(model, loader, device, criterion=None, optimizer=None):
     logits_stats = {"min": float("inf"), "max": -float("inf"),
                     "sum_abs": 0.0, "count": 0}
 
-    with torch.set_grad_enabled(training):
-        for padded, lengths, mask, ids, labels in loader:
-            padded = padded.to(device)
-            mask = mask.to(device)
-            labels = labels.to(device)
+    if training:
+        with torch.set_grad_enabled(True):
+            for padded, lengths, mask, ids, labels in loader:
+                padded = padded.to(device)
+                mask = mask.to(device)
+                labels = labels.to(device)
 
-            logits = model(padded, mask)
-            if training:
+                logits = model(padded, mask)
                 loss = criterion(logits, labels)
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 total_loss += loss.item() * len(labels)
+                _accumulate_stats(logits, labels, logits_stats, y_true, y_pred, y_prob)
+    else:
+        with torch.set_grad_enabled(False):
+            for padded, lengths, mask, ids, labels in loader:
+                padded = padded.to(device)
+                mask = mask.to(device)
+                labels = labels.to(device)
 
-            l = logits.detach()
-            logits_stats["min"] = min(logits_stats["min"], float(l.min().item()))
-            logits_stats["max"] = max(logits_stats["max"], float(l.max().item()))
-            logits_stats["sum_abs"] += float(l.abs().sum().item())
-            logits_stats["count"] += int(l.numel())
+                logits = model(padded, mask)
+                loss = criterion(logits, labels)
+                total_loss += loss.item() * len(labels)
+                _accumulate_stats(logits, labels, logits_stats, y_true, y_pred, y_prob)
 
-            probs = torch.sigmoid(logits).detach().cpu().numpy()
-            preds = (probs >= 0.5).astype(int)
-            y_true.extend(labels.cpu().numpy().tolist())
-            y_pred.extend(preds.tolist())
-            y_prob.extend(probs.tolist())
-
-    avg_loss = total_loss / max(len(loader.dataset), 1) if training else 0.0
+    avg_loss = total_loss / max(len(loader.dataset), 1)
+    return avg_loss, y_true, y_pred, y_prob, logits_stats
     return avg_loss, y_true, y_pred, y_prob, logits_stats
 
 
@@ -255,7 +269,7 @@ def cmd_train(args):
 
     for epoch in range(1, args.epochs + 1):
         tr_loss, _, _, _, tr_logits = _run_epoch(model, train_loader, device, criterion, optimizer)
-        va_loss, y_true, y_pred, _, va_logits = _run_epoch(model, val_loader, device)
+        va_loss, y_true, y_pred, _, va_logits = _run_epoch(model, val_loader, device, criterion, None)
         val_acc = float((np.array(y_true) == np.array(y_pred)).mean()) if y_true else 0.0
         mean_abs = va_logits["sum_abs"] / max(va_logits["count"], 1)
         sat = " !SAT" if mean_abs > 50 else ""
