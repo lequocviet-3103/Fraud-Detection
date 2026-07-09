@@ -12,10 +12,8 @@ import math
 import os
 import struct
 
-CASE_STUDY_ROOT = os.path.join(
-    "PasteTrace-release", "PasteTrace-release", "case studies", "sp2023", "pre-processed"
-)
-OUTPUT_DIR = os.path.join("data", "sequences")
+CASE_STUDY_ROOT = "test_new_cohort"
+OUTPUT_DIR = os.path.join("data", "train_sequences")
 INDEX_PATH = os.path.join("data", "sequences_index.csv")
 FEATURE_NAMES = ["is_type", "is_paste", "is_cut", "log_len", "src_external", "src_same", "src_other", "delta_time"]
 

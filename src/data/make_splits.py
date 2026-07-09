@@ -73,8 +73,8 @@ def make_splits(index_path: str, train_ratio: float, val_ratio: float, test_rati
 
     result = {
         "train": ids_train,
-        "val": ids_val,
-        "test": ids_test,
+        "val": [],
+        "test": [],
         "seed": seed,
         "ratios": {"train": train_ratio, "val": val_ratio, "test": test_ratio},
         "counts": {
