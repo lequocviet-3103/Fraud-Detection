@@ -30,6 +30,7 @@ SPLITS_PATH = os.path.join("data", "splits.json")
 SEQ_DIR = os.path.join("data", "train_sequences")
 INDEX_PATH = os.path.join("data", "sequences_index.csv")
 MODEL_DIR = os.path.join("models", "mamba")
+CASE_STUDY_ROOT = "test_new_cohort"
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 D_MODEL = 64
