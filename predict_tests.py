@@ -85,7 +85,7 @@ def extract_sequence_tests(meta_path: str) -> tuple[list[list[float]], bool]:
 
 # ── Main predictor ─────────────────────────────────────────────────────────────
 
-def predict_folder(tests_dir: str, threshold: float = 0.5):
+def predict_folder(tests_dir: str, threshold: float = 0.0):
     model_pt = os.path.join(MODEL_DIR, "mamba.pt")
     cfg_path = os.path.join(MODEL_DIR, "config.json")
     scaler_path = os.path.join(MODEL_DIR, "scaler.json")
