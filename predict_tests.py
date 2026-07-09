@@ -110,30 +110,46 @@ def predict_folder(tests_dir: str, threshold: float = 0.5):
     results = []
     skipped = []
 
+    student_files = []
     for root, _dirs, files in os.walk(tests_dir):
-        if "meta.json" not in files:
-            continue
+        for f in files:
+            if f == "meta.json":
+                student_files.append((root, f, "meta"))
+            elif f.endswith(".json") and f not in ("smoke_train.py",):
+                student_files.append((root, f, "session"))
 
-        meta_path = os.path.join(root, "meta.json")
+    seen_sessions = set()
+    for root, f, kind in student_files:
+        path = os.path.join(root, f)
         rel = os.path.relpath(root, tests_dir).replace(os.sep, "/")
 
         # Auto-detect schema
         try:
-            with open(meta_path, encoding="utf8", errors="ignore") as f:
-                sample = json.load(f)
-            schema = "tests" if "events" in sample else "cohort"
+            with open(path, encoding="utf8", errors="ignore") as fh:
+                sample = json.load(fh)
         except Exception:
-            skipped.append(f"{rel}: failed to read meta.json")
+            skipped.append(f"{rel}/{f}: failed to read json")
             continue
 
-        if schema == "cohort":
-            skipped.append(f"{rel}: cohort schema not supported in predict mode (use build_sequences + train)")
+        if not isinstance(sample, dict) or "events" not in sample:
+            skipped.append(f"{rel}/{f}: not a session (no 'events')")
             continue
 
-        seq, time_ok = extract_sequence_tests(meta_path)
+        schema = "tests" if isinstance(sample.get("events"), list) else "cohort"
+        if schema != "tests":
+            skipped.append(f"{rel}/{f}: cohort schema not supported in predict mode")
+            continue
+
+        # de-dupe by session_id (prefer meta.json when both exist)
+        sid = sample.get("session_id") or f"{rel}/{f}"
+        if sid in seen_sessions:
+            continue
+        seen_sessions.add(sid)
+
+        seq, time_ok = extract_sequence_tests(path)
 
         if not seq:
-            skipped.append(f"{rel}: no events extracted")
+            skipped.append(f"{rel}/{f}: no events extracted")
             continue
 
         seq_trimmed = seq[: cfg["max_len"]]
@@ -149,8 +165,9 @@ def predict_folder(tests_dir: str, threshold: float = 0.5):
         label_name = "Cheat" if pred == 1 else "Normal"
         ground_truth = sample.get("label")
 
+        display = sid.replace(os.sep, "/")
         results.append({
-            "path": rel,
+            "path": display,
             "pred": pred,
             "pred_label": label_name,
             "prob": prob,
