@@ -85,7 +85,7 @@ def extract_sequence_tests(meta_path: str) -> tuple[list[list[float]], bool]:
 
 # ── Main predictor ─────────────────────────────────────────────────────────────
 
-def predict_folder(tests_dir: str, threshold: float = 0.0):
+def predict_folder(tests_dir: str, threshold: float = 0.5):
     model_pt = os.path.join(MODEL_DIR, "mamba.pt")
     cfg_path = os.path.join(MODEL_DIR, "config.json")
     scaler_path = os.path.join(MODEL_DIR, "scaler.json")
@@ -202,6 +202,12 @@ def predict_folder(tests_dir: str, threshold: float = 0.0):
     if has_gt:
         correct = sum(1 for r in results if r["pred"] == r["ground_truth"])
         print(f"Accuracy: {correct}/{n_total} = {correct/n_total:.1%}")
+
+        # Threshold sweep
+        print("\nTHRESHOLD SWEEP (logit-based):")
+        for t in [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]:
+            c = sum(1 for r in results if (r["logit"] >= t) == r["ground_truth"])
+            print(f"  t={t:+.2f}: {c}/{n_total} = {c/n_total:.1%}")
 
     print("\nPREDICTIONS:")
     for r in results:
