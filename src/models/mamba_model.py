@@ -100,6 +100,8 @@ def _run_epoch(model, loader, device, criterion=None, optimizer=None):
     model.train(training)
     total_loss = 0.0
     y_true, y_pred, y_prob = [], [], []
+    logits_stats = {"min": float("inf"), "max": -float("inf"),
+                    "sum_abs": 0.0, "count": 0}
 
     with torch.set_grad_enabled(training):
         for padded, lengths, mask, ids, labels in loader:
@@ -116,6 +118,12 @@ def _run_epoch(model, loader, device, criterion=None, optimizer=None):
                 optimizer.step()
                 total_loss += loss.item() * len(labels)
 
+            l = logits.detach()
+            logits_stats["min"] = min(logits_stats["min"], float(l.min().item()))
+            logits_stats["max"] = max(logits_stats["max"], float(l.max().item()))
+            logits_stats["sum_abs"] += float(l.abs().sum().item())
+            logits_stats["count"] += int(l.numel())
+
             probs = torch.sigmoid(logits).detach().cpu().numpy()
             preds = (probs >= 0.5).astype(int)
             y_true.extend(labels.cpu().numpy().tolist())
@@ -123,7 +131,7 @@ def _run_epoch(model, loader, device, criterion=None, optimizer=None):
             y_prob.extend(probs.tolist())
 
     avg_loss = total_loss / max(len(loader.dataset), 1) if training else 0.0
-    return avg_loss, y_true, y_pred, y_prob
+    return avg_loss, y_true, y_pred, y_prob, logits_stats
 
 
 # ── TRAIN mode ────────────────────────────────────────────────────────────────
@@ -172,6 +180,30 @@ def _load_split_ids():
 def cmd_train(args):
     from src.models.mamba_dataset import SequenceDataset, build_scaler_from_ids, collate_fn
 
+    if args.train_data_dir and args.train_data_dir != CASE_STUDY_ROOT:
+        train_dir = args.train_data_dir
+        print(f"Rebuilding sequences from: {train_dir}")
+        from src.data.build_sequences import main as rebuild_main
+        import sys as _sys
+        saved_argv = _sys.argv
+        _sys.argv = ["build_sequences.py", "--data-dir", train_dir, "--output-dir", SEQ_DIR]
+        try:
+            rebuild_main()
+        finally:
+            _sys.argv = saved_argv
+    else:
+        train_dir = CASE_STUDY_ROOT
+        if not os.path.isfile(INDEX_PATH):
+            print(f"{INDEX_PATH} not found. Building from {train_dir}...")
+            from src.data.build_sequences import main as rebuild_main
+            import sys as _sys
+            saved_argv = _sys.argv
+            _sys.argv = ["build_sequences.py", "--data-dir", train_dir, "--output-dir", SEQ_DIR]
+            try:
+                rebuild_main()
+            finally:
+                _sys.argv = saved_argv
+
     if not os.path.isfile(INDEX_PATH):
         sys.exit(f"[ERROR] {INDEX_PATH} not found. Run build_sequences.py first.")
 
@@ -198,8 +230,12 @@ def cmd_train(args):
     train_labels = np.array([item["label"].item() for item in train_ds])
     n_pos = int(train_labels.sum())
     n_neg = int(len(train_labels) - n_pos)
-    pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32).to(device)
-    print(f"Train: {len(train_ids)} samples (cheat={n_pos}, normal={n_neg}), pos_weight={pos_weight.item():.2f}")
+    if args.no_pos_weight:
+        pos_weight = torch.tensor([1.0], dtype=torch.float32).to(device)
+        print(f"Train: {len(train_ids)} samples (cheat={n_pos}, normal={n_neg}), pos_weight=DISABLED (--no-pos-weight)")
+    else:
+        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32).to(device)
+        print(f"Train: {len(train_ids)} samples (cheat={n_pos}, normal={n_neg}), pos_weight={pos_weight.item():.2f}")
     print(f"Val  : {len(val_ids)} samples")
 
     n_features = train_ds[0]["seq"].shape[1]
@@ -213,13 +249,15 @@ def cmd_train(args):
     best_state = None
 
     print(f"\nTraining {args.epochs} epochs (patience={args.patience})...")
-    print(f"{'Epoch':>5} {'TrainLoss':>10} {'ValLoss':>10} {'ValAcc':>8}  Notes")
-    print("-" * 60)
+    print(f"{'Epoch':>5} {'TrainLoss':>10} {'ValLoss':>10} {'ValAcc':>8}  {'|logit|':>8}  Notes")
+    print("-" * 64)
 
     for epoch in range(1, args.epochs + 1):
-        tr_loss, _, _, _ = _run_epoch(model, train_loader, device, criterion, optimizer)
-        va_loss, y_true, y_pred, _ = _run_epoch(model, val_loader, device)
+        tr_loss, _, _, _, tr_logits = _run_epoch(model, train_loader, device, criterion, optimizer)
+        va_loss, y_true, y_pred, _, va_logits = _run_epoch(model, val_loader, device)
         val_acc = float((np.array(y_true) == np.array(y_pred)).mean()) if y_true else 0.0
+        mean_abs = va_logits["sum_abs"] / max(va_logits["count"], 1)
+        sat = " !SAT" if mean_abs > 50 else ""
 
         improved = va_loss < best_val_loss - 1e-6
         note = ""
@@ -234,7 +272,7 @@ def cmd_train(args):
             note = f"bad={bad_epochs}/{args.patience}"
 
         print(f"Epoch {epoch:3d}  Loss={tr_loss:.4f}  ValLoss={va_loss:.4f}  "
-              f"Acc={val_acc:.3f}  {note}")
+              f"Acc={val_acc:.3f}  |logit|={mean_abs:6.2f}{sat}  {note}")
 
         if bad_epochs >= args.patience:
             print(f"\n[Early stop] No improvement for {args.patience} epochs. "
@@ -334,6 +372,10 @@ def main():
         p.add_argument("--patience",      type=int,   default=PATIENCE)
         p.add_argument("--batch-size",    type=int,   default=BATCH_SIZE)
         p.add_argument("--max-len",       type=int,   default=MAX_LEN)
+        p.add_argument("--no-pos-weight", action="store_true",
+                       help="Disable pos_weight (use uniform class weighting)")
+        p.add_argument("--train-data-dir", default=CASE_STUDY_ROOT,
+                       help="Source folder for training data (default: test_new_cohort)")
 
     p_train = sub.add_parser("train", help="Train model on all dataset")
     _add_common(p_train)
