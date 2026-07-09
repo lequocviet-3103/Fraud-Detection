@@ -19,7 +19,7 @@ import streamlit as st
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-SEQ_DIR     = os.path.join(PROJECT_ROOT, "data", "sequences")
+SEQ_DIR     = os.path.join(PROJECT_ROOT, "data", "train_sequences")
 INDEX_PATH  = os.path.join(PROJECT_ROOT, "data", "sequences_index.csv")
 SPLITS_PATH = os.path.join(PROJECT_ROOT, "data", "splits.json")
 MODEL_DIR   = os.path.join(PROJECT_ROOT, "models", "mamba")
@@ -157,7 +157,7 @@ with tab_data:
     st.subheader("Buoc 1 — Build Sequences")
     st.markdown(
         "Doc `meta.json` cua tung sinh vien, trich chuoi su kien **T/P/C** "
-        "(bo qua L=O scaffold), luu vao `data/sequences/`."
+        "(bo qua L=O scaffold), luu vao `data/train_sequences/`."
     )
 
     col_dir, col_btn = st.columns([3, 1])

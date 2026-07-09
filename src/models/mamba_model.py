@@ -41,6 +41,8 @@ WEIGHT_DECAY = 0.01
 PATIENCE = 10
 BATCH_SIZE = 8
 MAX_LEN = 1000
+VAL_FRAC = 0.15  # only used when splits.json is absent
+SEED = 42
 
 
 # ── Mamba import with helpful error ──────────────────────────────────────────
@@ -125,15 +127,53 @@ def _run_epoch(model, loader, device, criterion=None, optimizer=None):
 
 
 # ── TRAIN mode ────────────────────────────────────────────────────────────────
+def _make_stratified_split(ids, labels, val_frac, seed):
+    """Stratified split into (train_ids, val_ids). Falls back to random on tiny classes."""
+    n_pos = sum(labels)
+    n_neg = len(labels) - n_pos
+    try:
+        from sklearn.model_selection import train_test_split
+        can_strat = min(n_pos, n_neg) >= 2 and len(set(labels)) > 1
+        if can_strat:
+            tr, va, _, _ = train_test_split(
+                ids, labels, test_size=val_frac, stratify=labels, random_state=seed
+            )
+            return tr, va
+    except Exception:
+        pass
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(ids))
+    n_val = max(1, int(round(len(ids) * val_frac)))
+    val_idx = set(perm[:n_val].tolist())
+    val_ids = [ids[i] for i in sorted(val_idx)]
+    train_ids = [ids[i] for i in range(len(ids)) if i not in val_idx]
+    return train_ids, val_ids
+
+
+def _load_split_ids():
+    """Return (train_ids, val_ids). Uses data/splits.json if present, else auto-splits."""
+    import pandas as pd
+    df = pd.read_csv(INDEX_PATH)
+    df = df[df["label"].isin([0, 1])].reset_index(drop=True)
+    ids = df["id"].tolist()
+    labels = df["label"].tolist()
+
+    if os.path.isfile(SPLITS_PATH):
+        with open(SPLITS_PATH, encoding="utf8") as f:
+            sp = json.load(f)
+        train_ids = sp.get("train", [])
+        val_ids = sp.get("val", [])
+        if train_ids and val_ids:
+            return train_ids, val_ids
+
+    return _make_stratified_split(ids, labels, VAL_FRAC, SEED)
+
+
 def cmd_train(args):
     from src.models.mamba_dataset import SequenceDataset, build_scaler_from_ids, collate_fn
-    import pandas as pd
 
     if not os.path.isfile(INDEX_PATH):
         sys.exit(f"[ERROR] {INDEX_PATH} not found. Run build_sequences.py first.")
-
-    df = pd.read_csv(INDEX_PATH)
-    train_ids = df["id"].tolist()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -141,48 +181,87 @@ def cmd_train(args):
         print("[WARNING] Mamba runs on CPU — this will be very slow and may not converge well.")
         print("          Consider using Google Colab/Kaggle GPU runtime.")
 
-    # Scaler fit on train only
+    train_ids, val_ids = _load_split_ids()
+
     scaler = build_scaler_from_ids(train_ids, SEQ_DIR)
     os.makedirs(MODEL_DIR, exist_ok=True)
     scaler.save(os.path.join(MODEL_DIR, "scaler.json"))
 
     train_ds = SequenceDataset(train_ids, SEQ_DIR, scaler=scaler, max_len=args.max_len)
+    val_ds   = SequenceDataset(val_ids,   SEQ_DIR, scaler=scaler, max_len=args.max_len)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               collate_fn=collate_fn, drop_last=False)
-    
-    # pos_weight from train labels
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
+                              collate_fn=collate_fn, drop_last=False)
+
     train_labels = np.array([item["label"].item() for item in train_ds])
-    n_pos = train_labels.sum()
-    n_neg = len(train_labels) - n_pos
+    n_pos = int(train_labels.sum())
+    n_neg = int(len(train_labels) - n_pos)
     pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32).to(device)
-    print(f"Train: {len(train_ids)} samples (cheat={int(n_pos)}, normal={int(n_neg)}), pos_weight={pos_weight.item():.2f}")
+    print(f"Train: {len(train_ids)} samples (cheat={n_pos}, normal={n_neg}), pos_weight={pos_weight.item():.2f}")
+    print(f"Val  : {len(val_ids)} samples")
 
     n_features = train_ds[0]["seq"].shape[1]
     model = MambaClassifier(n_features, args.d_model, args.n_layers, args.dropout).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    print(f"\nTraining {args.epochs} epochs...")
-    print(f"{'Epoch':>5} {'TrainLoss':>10}")
+    best_val_loss = math.inf
+    best_epoch = 0
+    bad_epochs = 0
+    best_state = None
+
+    print(f"\nTraining {args.epochs} epochs (patience={args.patience})...")
+    print(f"{'Epoch':>5} {'TrainLoss':>10} {'ValLoss':>10} {'ValAcc':>8}  Notes")
+    print("-" * 60)
 
     for epoch in range(1, args.epochs + 1):
         tr_loss, _, _, _ = _run_epoch(model, train_loader, device, criterion, optimizer)
-        print(f"Epoch {epoch:3d}  Loss={tr_loss:.4f}")
+        va_loss, y_true, y_pred, _ = _run_epoch(model, val_loader, device)
+        val_acc = float((np.array(y_true) == np.array(y_pred)).mean()) if y_true else 0.0
 
+        improved = va_loss < best_val_loss - 1e-6
+        note = ""
+        if improved:
+            best_val_loss = va_loss
+            best_epoch = epoch
+            bad_epochs = 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            note = f"*best"
+        else:
+            bad_epochs += 1
+            note = f"bad={bad_epochs}/{args.patience}"
 
-       
-        torch.save(model.state_dict(), os.path.join(MODEL_DIR, "mamba.pt")
-                   )
+        print(f"Epoch {epoch:3d}  Loss={tr_loss:.4f}  ValLoss={va_loss:.4f}  "
+              f"Acc={val_acc:.3f}  {note}")
+
+        if bad_epochs >= args.patience:
+            print(f"\n[Early stop] No improvement for {args.patience} epochs. "
+                  f"Best epoch={best_epoch}, best_val_loss={best_val_loss:.4f}")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"\nRestored best model from epoch {best_epoch} (val_loss={best_val_loss:.4f})")
+
+    final_path = os.path.join(MODEL_DIR, "mamba.pt")
+    torch.save(model.state_dict(), final_path)
     cfg = {
         "n_features": n_features,
         "d_model": args.d_model,
         "n_layers": args.n_layers,
         "dropout": args.dropout,
-        "max_len": args.max_len
+        "max_len": args.max_len,
+        "best_epoch": best_epoch,
+        "best_val_loss": float(best_val_loss),
+        "pos_weight": float(pos_weight.item()),
     }
     with open(os.path.join(MODEL_DIR, "config.json"), "w", encoding="utf8") as f:
         json.dump(cfg, f, indent=2)
+
+    print(f"\nSaved {final_path}")
+    print(f"Saved {os.path.join(MODEL_DIR, 'config.json')}")
 
 
 

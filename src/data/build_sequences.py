@@ -46,6 +46,32 @@ def _paste_source(note: str):
     return 0, 0, 1  # unknown paste origin -> other
 
 
+def _read_time(ev: dict) -> int | None:
+    """Read event timestamp, supporting both schemas in the dataset:
+      - new schema: lowercase "t" (int ms), as in test_new_cohort/*/meta.json
+      - old schema: uppercase "T" (base64-encoded long ms), as in PasteTrace
+        pre-processed meta.json files.
+    Returns None if neither key is present or decoding fails.
+    """
+    for key in ("t", "T"):
+        if key not in ev:
+            continue
+        val = ev[key]
+        if val is None:
+            continue
+        # New schema: plain int (or numeric string)
+        if key == "t":
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                continue
+        # Old schema: base64-encoded long ms
+        ts = _decode_time(val)
+        if ts is not None:
+            return ts
+    return None
+
+
 def extract_sequence(meta_paths: list[str]) -> tuple[list[list[float]], bool]:
     """Return (seq, time_available) from one or more meta.json paths."""
     all_events = []
@@ -78,7 +104,7 @@ def extract_sequence(meta_paths: list[str]) -> tuple[list[list[float]], bool]:
         else:
             src_e, src_s, src_o = 0.0, 0.0, 0.0
 
-        ts = _decode_time(ev.get("T"))
+        ts = _read_time(ev)
         if ts is not None and prev_ts is not None:
             delta = max(0.0, float(ts - prev_ts))
             time_available = True

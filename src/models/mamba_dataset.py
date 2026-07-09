@@ -14,6 +14,9 @@ from torch.utils.data import Dataset
 SCALER_PATH = os.path.join("models", "mamba", "scaler.json")
 # Indices of continuous features that need scaling (log_len=3, delta_time=7)
 CONTINUOUS_IDXS = [3, 7]
+# Default location for the per-student .json sequence files produced by
+# build_sequences.py. Override via the seq_dir argument if you used --output-dir.
+DEFAULT_SEQ_DIR = os.path.join("data", "train_sequences")
 
 
 class SequenceScaler:
@@ -67,12 +70,12 @@ class SequenceScaler:
 
 
 class SequenceDataset(Dataset):
-    """Load behavioral sequences from data/sequences/<id>.json files."""
+    """Load behavioral sequences from data/train_sequences/<id>.json files."""
 
     def __init__(
         self,
         ids: list[str],
-        seq_dir: str = os.path.join("data", "sequences"),
+        seq_dir: str = DEFAULT_SEQ_DIR,
         scaler: Optional[SequenceScaler] = None,
         max_len: int = 1000,
     ):
@@ -101,7 +104,7 @@ class SequenceDataset(Dataset):
         return self.records[idx]
 
 
-def build_scaler_from_ids(train_ids: list[str], seq_dir: str = os.path.join("data", "sequences")) -> SequenceScaler:
+def build_scaler_from_ids(train_ids: list[str], seq_dir: str = DEFAULT_SEQ_DIR) -> SequenceScaler:
     """Fit scaler on raw (unscaled) train sequences only."""
     seqs = []
     for sid in train_ids:
