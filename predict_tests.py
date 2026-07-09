@@ -159,6 +159,7 @@ def predict_folder(tests_dir: str, threshold: float = 0.5):
 
         with torch.no_grad():
             logit = model(seq_t, mask)
+            logit_val = float(logit.item())
             prob = torch.sigmoid(logit).item()
 
         pred = 1 if prob >= threshold else 0
@@ -171,6 +172,7 @@ def predict_folder(tests_dir: str, threshold: float = 0.5):
             "pred": pred,
             "pred_label": label_name,
             "prob": prob,
+            "logit": logit_val,
             "ground_truth": ground_truth,
             "n_events": len(seq),
             "time_ok": time_ok,
@@ -209,9 +211,9 @@ def predict_folder(tests_dir: str, threshold: float = 0.5):
         if r["ground_truth"] is not None:
             gt_name = "CHEAT" if r["ground_truth"] == 1 else "NORMAL"
             match = "OK" if r["pred"] == r["ground_truth"] else "MISS"
-            suffix = f"   [gt={gt_name} {match}  prob={r['prob']:.3f}]"
+            suffix = f"   [gt={gt_name} {match}  prob={r['prob']:.3f} logit={r['logit']:+.2f}]"
         else:
-            suffix = f"   [prob={r['prob']:.3f}]"
+            suffix = f"   [prob={r['prob']:.3f} logit={r['logit']:+.2f}]"
         print(f"  {label:6} -> {path}{suffix}")
     print()
 
