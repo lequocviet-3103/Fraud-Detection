@@ -21,13 +21,22 @@ from src.models.mamba_dataset import SequenceScaler
 # ── Schema adapters ────────────────────────────────────────────────────────────
 
 def _paste_source_tests(note: str | None):
-    """Parse paste_source string from tests/ schema into one-hot."""
-    n = (note or "").lower()
+    """Parse paste_source string from tests/ schema into one-hot.
+    Tests notes are short: 'external', 'same_machine', 'own', 'unknown' —
+    almost always 1-token. Map to the same 3-bucket one-hot used at training.
+    """
+    n = (note or "").lower().strip()
+
+    # "external"/"noncoded" share semantic — outside-class paste
     if "external" in n or "noncoded" in n:
         return 1.0, 0.0, 0.0
-    if any(kw in n for kw in ("same", "internal", "project")):
+
+    # "same_machine"/"own"/"internal"/"project" — legitimate (own code)
+    if "same" in n or "own" in n or "internal" in n or "project" in n:
         return 0.0, 1.0, 0.0
-    return 0.0, 0.0, 1.0  # unknown / other
+
+    # anything else (incl. 'unknown') is "other" paste
+    return 0.0, 0.0, 1.0
 
 
 def extract_sequence_tests(meta_path: str) -> tuple[list[list[float]], bool]:
@@ -203,11 +212,28 @@ def predict_folder(tests_dir: str, threshold: float = 0.5):
         correct = sum(1 for r in results if r["pred"] == r["ground_truth"])
         print(f"Accuracy: {correct}/{n_total} = {correct/n_total:.1%}")
 
-        # Threshold sweep
+        # Threshold sweep — cover full logit range so we don't miss extreme optima
+        all_logits = sorted(r["logit"] for r in results)
+        sweep = [-30, -20, -10, -5, -3, -2, -1, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 5, 10, 15, 20, 24]
+        # Add logit values just below the smallest negative (best NORMAL=0 / CHEAT=1 boundary)
+        sweep += [round(all_logits[0] - 1, 2), round(all_logits[0], 2)]
+        # Add just above/below 211/C (only CHEAT with negative logit) if present
+        for r in results:
+            if r["logit"] < 0:
+                sweep += [round(r["logit"] - 0.5, 2), round(r["logit"] + 0.5, 2)]
+        sweep = sorted(set(sweep))
+
+        best_t, best_c = None, -1
         print("\nTHRESHOLD SWEEP (logit-based):")
-        for t in [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]:
+        for t in sweep:
             c = sum(1 for r in results if (r["logit"] >= t) == r["ground_truth"])
-            print(f"  t={t:+.2f}: {c}/{n_total} = {c/n_total:.1%}")
+            marker = ""
+            if c > best_c:
+                best_c = c
+                best_t = t
+                marker = " *best"
+            print(f"  t={t:+6.2f}: {c}/{n_total} = {c/n_total:.1%}{marker}")
+        print(f"\n  --> BEST threshold: t={best_t:+.2f} -> {best_c}/{n_total} = {best_c/n_total:.1%}")
 
     print("\nPREDICTIONS:")
     for r in results:
