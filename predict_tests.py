@@ -77,6 +77,12 @@ def extract_sequence_tests(meta_path: str) -> tuple[list[list[float]], bool]:
                 ts_ms = int(float(t_raw) * 1000)
                 if prev_ms is not None:
                     delta = max(0.0, float(ts_ms - prev_ms))
+                    # Clip extreme deltas so test events don't blow up the
+                    # train-fit scaler. Train median delta ~119ms,
+                    # train 99th percentile ~5s; anything beyond 1h is a
+                    # session gap, not a behavioral signal.
+                    if delta > 60_000:  # 1 minute
+                        delta = 60_000
                     if delta > 0:
                         time_available = True
                 else:
