@@ -2,6 +2,20 @@
 
 Scaler is fit ONLY on train split and saved to models/mamba/scaler.json
 to prevent data leakage into val/test.
+
+Feature schema (8 columns, order matters):
+  0 is_type        0/1 indicator for type events
+  1 is_paste       0/1 indicator for paste events
+  2 is_cut         0/1 indicator for cut/delete events
+  3 log_len        log1p(char count) — bounded ~log1p(text)
+  4 src_external   0/1
+  5 src_same       0/1
+  6 src_other      0/1
+  7 delta_time     log1p(milliseconds between consecutive events)
+
+delta_time is in log-space so train and test distributions are comparable
+even when test sessions have multi-hour gaps (otherwise a single gap would
+be a >10 std outlier and dominate the model).
 """
 import json
 import os

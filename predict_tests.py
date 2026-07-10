@@ -79,8 +79,8 @@ def extract_sequence_tests(meta_path: str) -> tuple[list[list[float]], bool]:
                     delta = max(0.0, float(ts_ms - prev_ms))
                     # Clip extreme deltas so test events don't blow up the
                     # train-fit scaler. Train median delta ~119ms,
-                    # train 99th percentile ~5s; anything beyond 1h is a
-                    # session gap, not a behavioral signal.
+                    # train 99th percentile ~5s; anything beyond 1 minute
+                    # is a session gap, not a behavioral signal.
                     if delta > 60_000:  # 1 minute
                         delta = 60_000
                     if delta > 0:
@@ -92,6 +92,10 @@ def extract_sequence_tests(meta_path: str) -> tuple[list[list[float]], bool]:
                 delta = 0.0
         else:
             delta = 0.0
+
+        # IMPORTANT: must mirror build_sequences.py — apply log1p to delta
+        # so train/test live in the same compressed feature space.
+        delta = math.log1p(delta)
 
         seq.append([is_type, is_paste, is_cut, log_len, src_e, src_s, src_o, delta])
 

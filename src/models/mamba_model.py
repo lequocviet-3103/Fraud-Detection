@@ -38,7 +38,8 @@ N_LAYERS = 2
 DROPOUT = 0.2
 EPOCHS = 80
 LR = 1e-3
-WEIGHT_DECAY = 0.01
+WEIGHT_DECAY = 0.05
+LABEL_SMOOTHING = 0.05
 PATIENCE = 10
 BATCH_SIZE = 8
 MAX_LEN = 1000
@@ -109,7 +110,7 @@ def _accumulate_stats(logits, labels, stats, y_true, y_pred, y_prob):
     y_prob.extend(probs.tolist())
 
 
-def _run_epoch(model, loader, device, criterion=None, optimizer=None):
+def _run_epoch(model, loader, device, criterion=None, optimizer=None, label_smoothing=0.0):
     training = criterion is not None and optimizer is not None
     model.train(training)
     total_loss = 0.0
@@ -124,8 +125,14 @@ def _run_epoch(model, loader, device, criterion=None, optimizer=None):
                 mask = mask.to(device)
                 labels = labels.to(device)
 
+                # Apply label smoothing to training targets only
+                if label_smoothing > 0:
+                    soft_labels = labels.float() * (1.0 - label_smoothing) + label_smoothing * 0.5
+                else:
+                    soft_labels = labels.float()
+
                 logits = model(padded, mask)
-                loss = criterion(logits, labels)
+                loss = criterion(logits, soft_labels)
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -173,8 +180,8 @@ def _make_stratified_split(ids, labels, val_frac, seed):
     return train_ids, val_ids
 
 
-def _load_split_ids():
-    """Return (train_ids, val_ids). Uses data/splits.json if present, else auto-splits."""
+def _load_split_ids(val_frac, seed):
+    """Return (train_ids, val_ids). Uses data/splits.json if present, else stratified split."""
     import pandas as pd
     df = pd.read_csv(INDEX_PATH)
     df = df[df["label"].isin([0, 1])].reset_index(drop=True)
@@ -189,7 +196,7 @@ def _load_split_ids():
         if train_ids and val_ids:
             return train_ids, val_ids
 
-    return _make_stratified_split(ids, labels, VAL_FRAC, SEED)
+    return _make_stratified_split(ids, labels, val_frac, seed)
 
 
 def cmd_train(args):
@@ -228,7 +235,7 @@ def cmd_train(args):
         print("[WARNING] Mamba runs on CPU — this will be very slow and may not converge well.")
         print("          Consider using Google Colab/Kaggle GPU runtime.")
 
-    train_ids, val_ids = _load_split_ids()
+    train_ids, val_ids = _load_split_ids(args.val_frac, SEED)
 
     scaler = build_scaler_from_ids(train_ids, SEQ_DIR)
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -245,18 +252,28 @@ def cmd_train(args):
     train_labels = np.array([item["label"].item() for item in train_ds])
     n_pos = int(train_labels.sum())
     n_neg = int(len(train_labels) - n_pos)
-    if args.no_pos_weight:
-        pos_weight = torch.tensor([1.0], dtype=torch.float32).to(device)
-        print(f"Train: {len(train_ids)} samples (cheat={n_pos}, normal={n_neg}), pos_weight=DISABLED (--no-pos-weight)")
-    else:
+    pos_weight = torch.tensor([1.0], dtype=torch.float32).to(device)
+    use_pos_weight = not args.no_pos_weight
+    if use_pos_weight:
         pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32).to(device)
-        print(f"Train: {len(train_ids)} samples (cheat={n_pos}, normal={n_neg}), pos_weight={pos_weight.item():.2f}")
-    print(f"Val  : {len(val_ids)} samples")
+
+    val_labels = np.array([item["label"].item() for item in val_ds])
+    val_pos = int(val_labels.sum())
+    val_neg = int(len(val_labels) - val_pos)
+
+    print(f"Train: {len(train_ids)} samples (cheat={n_pos}, normal={n_neg}), "
+          f"pos_weight={pos_weight.item():.2f}" + (
+              f", label_smoothing={args.label_smoothing}" if args.label_smoothing else ""))
+    print(f"Val  : {len(val_ids)} samples (cheat={val_pos}, normal={val_neg}) "
+          f"[stratified {args.val_frac:.0%}]")
 
     n_features = train_ds[0]["seq"].shape[1]
     model = MambaClassifier(n_features, args.d_model, args.n_layers, args.dropout).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    def _apply_smoothing(labels, eps):
+        return labels * (1.0 - eps) + eps * 0.5
 
     best_val_loss = math.inf
     best_epoch = 0
@@ -268,8 +285,10 @@ def cmd_train(args):
     print("-" * 64)
 
     for epoch in range(1, args.epochs + 1):
-        tr_loss, _, _, _, tr_logits = _run_epoch(model, train_loader, device, criterion, optimizer)
-        va_loss, y_true, y_pred, _, va_logits = _run_epoch(model, val_loader, device, criterion, None)
+        ls = args.label_smoothing if args.label_smoothing else 0.0
+        tr_loss, _, _, _, tr_logits = _run_epoch(model, train_loader, device, criterion, optimizer, label_smoothing=ls)
+        # Validation always uses hard labels (no smoothing at eval time)
+        va_loss, y_true, y_pred, _, va_logits = _run_epoch(model, val_loader, device, criterion, None, label_smoothing=0.0)
         val_acc = float((np.array(y_true) == np.array(y_pred)).mean()) if y_true else 0.0
         mean_abs = va_logits["sum_abs"] / max(va_logits["count"], 1)
         sat = " !SAT" if mean_abs > 50 else ""
@@ -384,7 +403,11 @@ def main():
         p.add_argument("--epochs",        type=int,   default=EPOCHS)
         p.add_argument("--lr",            type=float, default=LR)
         p.add_argument("--weight-decay",  type=float, default=WEIGHT_DECAY)
+        p.add_argument("--label-smoothing", type=float, default=LABEL_SMOOTHING,
+                       help="Soft target smoothing [0-0.5]. Default: 0.05.")
         p.add_argument("--patience",      type=int,   default=PATIENCE)
+        p.add_argument("--val-frac",      type=float, default=VAL_FRAC,
+                       help="Validation fraction for stratified split. Default: 0.15.")
         p.add_argument("--batch-size",    type=int,   default=BATCH_SIZE)
         p.add_argument("--max-len",       type=int,   default=MAX_LEN)
         p.add_argument("--no-pos-weight", action="store_true",

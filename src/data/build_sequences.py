@@ -106,14 +106,18 @@ def extract_sequence(meta_paths: list[str]) -> tuple[list[list[float]], bool]:
 
         ts = _read_time(ev)
         if ts is not None and prev_ts is not None:
-            delta = max(0.0, float(ts - prev_ts))
+            delta_raw = max(0.0, float(ts - prev_ts))
             time_available = True
         else:
-            delta = 0.0
+            delta_raw = 0.0
         if ts is not None:
             prev_ts = ts
 
-        seq.append([is_type, is_paste, is_cut, log_len, float(src_e), float(src_s), float(src_o), delta])
+        # log1p on raw delta (ms) — compresses 0..80M ms range to ~0..18,
+        # removes outlier influence, makes train/test delta distributions align.
+        delta_log = math.log1p(delta_raw)
+
+        seq.append([is_type, is_paste, is_cut, log_len, float(src_e), float(src_s), float(src_o), delta_log])
 
     return seq, time_available
 
