@@ -81,6 +81,8 @@ def main():
         "--weight-decay", str(args.weight_decay),
         "--dropout", str(args.dropout),
         "--max-len", str(args.max_len),
+        "--lr", "1e-3",
+        "--batch-size", "8",
     ]
     if args.no_pos_weight:
         train_cmd.append("--no-pos-weight")

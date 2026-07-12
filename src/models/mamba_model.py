@@ -49,6 +49,12 @@ SEED = 42
 
 # ── Mamba import with helpful error ──────────────────────────────────────────
 def _import_mamba():
+    # Auto-detect causal_conv1d_cuda.so neu pip install --no-index khong copy dung.
+    # Build bang setup.py build_ext --inplace de file o /tmp/causal-conv1d-src/.
+    for _p in ('/tmp/causal-conv1d-src',
+               '/usr/local/lib/python3.12/dist-packages/causal_conv1d'):
+        if os.path.isdir(_p) and _p not in sys.path:
+            sys.path.insert(0, _p)
     try:
         from mamba_ssm import Mamba
         return Mamba
