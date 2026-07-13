@@ -64,30 +64,88 @@ def _import_mamba():
         import torch.nn.functional as F
         from einops import rearrange
 
-        _ss_fn = ssi.selective_scan_fn  # pure-PyTorch selective scan
+        _ss_fn = ssi.selective_scan_fn  # pure-PyTorch selective scan (CPU-safe)
 
-        def _slow_fwd(self, xz, conv1d_weight, conv1d_bias, x_proj_weight,
-                      delta_proj_weight, A, B, C, D, dt_bias, delta_softplus,
-                      ofloat=None):
-            """Pure-PyTorch MambaInnerFn.forward — no CUDA kernel needed."""
+        def _slow_fwd(ctx, xz, conv1d_weight, conv1d_bias, x_proj_weight,
+                      delta_proj_weight, out_proj_weight, out_proj_bias,
+                      A, B, C, D, delta_bias, B_proj_bias, C_proj_bias,
+                      delta_softplus, checkpoint_lvl, b_rms_weight, c_rms_weight,
+                      dt_rms_weight, b_c_dt_rms_eps):
+            """Pure-PyTorch MambaInnerFn.forward — no CUDA kernel needed.
+            Signature must match mamba-ssm v2.2.5: 21 args total.
+            """
+            L = xz.shape[-1]
+            delta_rank = delta_proj_weight.shape[1]
+            d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
+
+            x, z = xz.chunk(2, dim=1)
+
+            # causal conv1d → element-wise SiLU in PyTorch
+            import torch
             if conv1d_bias is not None:
-                xz = xz + conv1d_bias
-            x = xz[..., :xz.shape[-1] // 2]
-            z = xz[..., xz.shape[-1] // 2:]
-            x = x * torch.sigmoid(x)
-            x_dbl = F.linear(rearrange(x, 'b d s -> b s d'), x_proj_weight)
-            dt = F.linear(x_dbl, delta_proj_weight)
-            if dt_bias is not None:
-                dt = dt + dt_bias
-            dt = F.softplus(dt)
-            y = _ss_fn(
-                rearrange(x, 'b d s -> b s d'), dt, A, B, C, D,
-                z=rearrange(z, 'b d s -> b d s'),
-                delta_bias=dt_bias, delta_softplus=True, return_last_state=False)
-            y = rearrange(y, 'b d s -> b s d')
-            if z.numel() > 0:
-                y = y * torch.sigmoid(z)
-            return y
+                x = x + conv1d_bias.unsqueeze(-1)
+            x = x * torch.sigmoid(x)  # SiLU
+
+            # project to delta, B, C
+            x_dbl = F.linear(rearrange(x, 'b d l -> (b l) d'), x_proj_weight)
+            delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(),
+                             "d (b l) -> b d l", l=L)
+
+            if B is None:
+                B = x_dbl[:, delta_rank:delta_rank + d_state]
+                if B_proj_bias is not None:
+                    B = B + B_proj_bias.to(dtype=B.dtype)
+                if not A.is_complex():
+                    B = rearrange(B, "(b l) dstate -> b 1 dstate l", l=L).contiguous()
+                else:
+                    B = rearrange(B, "(b l) (dstate two) -> b 1 dstate (l two)",
+                                 l=L, two=2).contiguous()
+            else:
+                if B.stride(-1) != 1:
+                    B = B.contiguous()
+
+            if C is None:
+                C = x_dbl[:, -d_state:]
+                if C_proj_bias is not None:
+                    C = C + C_proj_bias.to(dtype=C.dtype)
+                if not A.is_complex():
+                    C = rearrange(C, "(b l) dstate -> b 1 dstate l", l=L).contiguous()
+                else:
+                    C = rearrange(C, "(b l) (dstate two) -> b 1 dstate (l two)",
+                                 l=L, two=2).contiguous()
+            else:
+                if C.stride(-1) != 1:
+                    C = C.contiguous()
+
+            if D is not None:
+                D = D.contiguous()
+
+            # RMSNorm on B/C/delta if present
+            if b_rms_weight is not None:
+                B = rearrange(B, "b 1 dstate l -> (b l) dstate", l=L).contiguous()
+                B = ssi.rms_norm_forward(B, b_rms_weight, None,
+                                        eps=b_c_dt_rms_eps)
+                B = rearrange(B, "(b l) dstate -> b 1 dstate l", l=L).contiguous()
+            if c_rms_weight is not None:
+                C = rearrange(C, "b 1 dstate l -> (b l) dstate", l=L).contiguous()
+                C = ssi.rms_norm_forward(C, c_rms_weight, None,
+                                        eps=b_c_dt_rms_eps)
+                C = rearrange(C, "(b l) dstate -> b 1 dstate l", l=L).contiguous()
+            if dt_rms_weight is not None:
+                delta = rearrange(delta, "b d l -> (b l) d", l=L).contiguous()
+                delta = ssi.rms_norm_forward(delta, dt_rms_weight, None,
+                                             eps=b_c_dt_rms_eps)
+                delta = rearrange(delta, "(b l) d -> b d l", l=L).contiguous()
+
+            # selective scan (pure PyTorch, no CUDA kernel)
+            y = _ss_fn(x, delta, A, B, C, D,
+                       z=z, delta_bias=delta_bias,
+                       delta_softplus=delta_softplus,
+                       return_last_state=False)
+
+            # output projection
+            out = F.linear(rearrange(y, "b d l -> b l d"), out_proj_weight, out_proj_bias)
+            return out
 
         ssi.MambaInnerFn.forward = _slow_fwd
         _import_mamba._patched = True
