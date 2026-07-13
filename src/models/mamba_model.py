@@ -47,14 +47,51 @@ VAL_FRAC = 0.15  # only used when splits.json is absent
 SEED = 42
 
 
-# ── Mamba import with helpful error ──────────────────────────────────────────
+# ── Mamba import with slow-path patch ─────────────────────────────────────
 def _import_mamba():
     # Auto-detect causal_conv1d_cuda.so neu pip install --no-index khong copy dung.
-    # Build bang setup.py build_ext --inplace de file o /tmp/causal-conv1d-src/.
     for _p in ('/tmp/causal-conv1d-src',
                '/usr/local/lib/python3.12/dist-packages/causal_conv1d'):
         if os.path.isdir(_p) and _p not in sys.path:
             sys.path.insert(0, _p)
+
+    # ── Patch mamba_ssm to use pure-PyTorch slow path ──────────────────────
+    # Reason: causal_conv1d_cuda.so fails to load on Kaggle (libc10.so not found).
+    # Assertion in MambaInnerFn.forward: "causal_conv1d_cuda is not available."
+    # Fix: replace MambaInnerFn.forward body with pure-PyTorch ops.
+    if not getattr(_import_mamba, '_patched', False):
+        import mamba_ssm.ops.selective_scan_interface as ssi
+        import torch.nn.functional as F
+        from einops import rearrange
+
+        _ss_fn = ssi.selective_scan_fn  # pure-PyTorch selective scan
+
+        def _slow_fwd(self, xz, conv1d_weight, conv1d_bias, x_proj_weight,
+                      delta_proj_weight, A, B, C, D, dt_bias, delta_softplus,
+                      ofloat=None):
+            """Pure-PyTorch MambaInnerFn.forward — no CUDA kernel needed."""
+            if conv1d_bias is not None:
+                xz = xz + conv1d_bias
+            x = xz[..., :xz.shape[-1] // 2]
+            z = xz[..., xz.shape[-1] // 2:]
+            x = x * torch.sigmoid(x)
+            x_dbl = F.linear(rearrange(x, 'b d s -> b s d'), x_proj_weight)
+            dt = F.linear(x_dbl, delta_proj_weight)
+            if dt_bias is not None:
+                dt = dt + dt_bias
+            dt = F.softplus(dt)
+            y = _ss_fn(
+                rearrange(x, 'b d s -> b s d'), dt, A, B, C, D,
+                z=rearrange(z, 'b d s -> b d s'),
+                delta_bias=dt_bias, delta_softplus=True, return_last_state=False)
+            y = rearrange(y, 'b d s -> b s d')
+            if z.numel() > 0:
+                y = y * torch.sigmoid(z)
+            return y
+
+        ssi.MambaInnerFn.forward = _slow_fwd
+        _import_mamba._patched = True
+
     try:
         from mamba_ssm import Mamba
         return Mamba
@@ -158,7 +195,6 @@ def _run_epoch(model, loader, device, criterion=None, optimizer=None, label_smoo
                 _accumulate_stats(logits, labels, logits_stats, y_true, y_pred, y_prob)
 
     avg_loss = total_loss / max(len(loader.dataset), 1)
-    return avg_loss, y_true, y_pred, y_prob, logits_stats
     return avg_loss, y_true, y_pred, y_prob, logits_stats
 
 
@@ -340,8 +376,6 @@ def cmd_train(args):
 
     print(f"\nSaved {final_path}")
     print(f"Saved {os.path.join(MODEL_DIR, 'config.json')}")
-
-
 
 
 
