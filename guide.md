@@ -330,7 +330,7 @@ trên TaskTracker train split.
 ```bash
 python -m src.data.build_sequences --train-dir tasktracker --test-dir pastetrace --min-events 1
 python -m src.data.make_splits --val 0.15 --seed 42
-python -m src.models.mamba_model train
+python -m src.models.mamba_model train --train-all
 python -m src.models.mamba_model test
 ```
 

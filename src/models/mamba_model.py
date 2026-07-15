@@ -204,10 +204,15 @@ def cmd_train(args: argparse.Namespace) -> None:
     )
 
     splits = _required_training_inputs()
-    train_ids = list(splits.get("train", []))
-    val_ids = list(splits.get("val", []))
-    if not train_ids or not val_ids:
-        raise SystemExit("[ERROR] Train/validation split dang rong.")
+    train_all = bool(getattr(args, "train_all", False))
+    if train_all:
+        train_ids = list(_read_index(TRAIN_INDEX_PATH))
+        val_ids: list[str] = []
+    else:
+        train_ids = list(splits.get("train", []))
+        val_ids = list(splits.get("val", []))
+    if not train_ids or (not train_all and not val_ids):
+        raise SystemExit("[ERROR] Train/validation data dang rong.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -221,8 +226,12 @@ def cmd_train(args: argparse.Namespace) -> None:
     train_dataset = SequenceDataset(
         train_ids, str(TRAIN_SEQ_DIR), scaler=scaler, max_len=args.max_len
     )
-    val_dataset = SequenceDataset(
-        val_ids, str(TRAIN_SEQ_DIR), scaler=scaler, max_len=args.max_len
+    val_dataset = (
+        None
+        if train_all
+        else SequenceDataset(
+            val_ids, str(TRAIN_SEQ_DIR), scaler=scaler, max_len=args.max_len
+        )
     )
     train_loader = DataLoader(
         train_dataset,
@@ -230,11 +239,15 @@ def cmd_train(args: argparse.Namespace) -> None:
         shuffle=True,
         collate_fn=collate_fn,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
+    val_loader = (
+        None
+        if val_dataset is None
+        else DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+        )
     )
 
     train_labels = np.array(
@@ -258,12 +271,22 @@ def cmd_train(args: argparse.Namespace) -> None:
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 
-    print(
-        f"TaskTracker train={len(train_dataset)}, val={len(val_dataset)} "
-        f"(train cheat={positives}, normal={negatives})"
-    )
+    if train_all:
+        print(
+            f"TaskTracker train-all={len(train_dataset)} "
+            f"(cheat={positives}, normal={negatives})"
+        )
+        print("Validation disabled; model se chay du so epoch da chon.")
+    else:
+        print(
+            f"TaskTracker train={len(train_dataset)}, val={len(val_dataset)} "
+            f"(train cheat={positives}, normal={negatives})"
+        )
     print("PasteTrace khong duoc dung trong buoc train nay.")
-    print(f"{'Epoch':>5} {'TrainLoss':>10} {'ValLoss':>10} {'ValMacroF1':>11}")
+    if train_all:
+        print(f"{'Epoch':>5} {'TrainLoss':>10}")
+    else:
+        print(f"{'Epoch':>5} {'TrainLoss':>10} {'ValLoss':>10} {'ValMacroF1':>11}")
 
     model_path = os.path.join(MODEL_DIR, "mamba.pt")
     best_f1 = -1.0
@@ -275,6 +298,11 @@ def cmd_train(args: argparse.Namespace) -> None:
         train_loss, *_ = _run_epoch(
             model, train_loader, device, criterion, optimizer
         )
+        if train_all:
+            print(f"{epoch:5d} {train_loss:10.4f}")
+            continue
+
+        assert val_loader is not None
         val_loss, val_true, val_pred, val_prob, _ = _run_epoch(
             model, val_loader, device, criterion
         )
@@ -296,6 +324,12 @@ def cmd_train(args: argparse.Namespace) -> None:
                 print(f"Early stopping tai epoch {epoch}.")
                 break
 
+    if train_all:
+        torch.save(model.state_dict(), model_path)
+        best_epoch = args.epochs
+        best_f1 = None
+        best_loss = None
+
     majority_class = int(positives >= negatives)
     config = {
         "n_features": n_features,
@@ -307,6 +341,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         "best_epoch": best_epoch,
         "best_val_macro_f1": best_f1,
         "best_val_loss": best_loss,
+        "training_mode": "all_tasktracker" if train_all else "train_val",
+        "n_train_samples": len(train_dataset),
+        "n_val_samples": 0 if val_dataset is None else len(val_dataset),
         "train_source": "tasktracker",
         "test_source": "pastetrace",
         "majority_class_from_train": majority_class,
@@ -317,7 +354,10 @@ def cmd_train(args: argparse.Namespace) -> None:
     config["feature_names"] = FEATURE_NAMES
     with open(os.path.join(MODEL_DIR, "config.json"), "w", encoding="utf8") as handle:
         json.dump(config, handle, indent=2, ensure_ascii=False)
-    print(f"Best model saved -> {model_path} (epoch={best_epoch})")
+    if train_all:
+        print(f"Final model saved -> {model_path} (epoch={best_epoch})")
+    else:
+        print(f"Best model saved -> {model_path} (epoch={best_epoch})")
 
 
 def _load_model_and_scaler(device: torch.device):
@@ -471,6 +511,11 @@ def main() -> None:
     train_parser.add_argument("--patience", type=int, default=PATIENCE)
     train_parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     train_parser.add_argument("--max-len", type=int, default=MAX_LEN)
+    train_parser.add_argument(
+        "--train-all",
+        action="store_true",
+        help="Train on all TaskTracker sessions; disable validation/early stopping",
+    )
 
     subparsers.add_parser("test", help="Evaluate frozen model on PasteTrace")
     predict_parser = subparsers.add_parser("predict", help="Predict one normalized JSON")

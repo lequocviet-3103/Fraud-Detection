@@ -19,7 +19,7 @@ Chay CLI:
 ```bash
 python -m src.data.build_sequences --train-dir tasktracker --test-dir pastetrace --min-events 1
 python -m src.data.make_splits --val 0.15 --seed 42
-python -m src.models.mamba_model train --epochs 80 --batch-size 8
+python -m src.models.mamba_model train --train-all --epochs 80 --batch-size 8
 python -m src.models.mamba_model test
 ```
 
@@ -40,6 +40,10 @@ streamlit run src/ui/mamba_app.py
 ```
 
 Notebook GPU: `notebooks/mamba_colab.ipynb`.
+
+`--train-all` dung toan bo TaskTracker de fit scaler va train model. Che do nay
+khong co validation/early stopping; nen chot hyperparameter bang che do train/val
+truoc, sau do moi train-all lan cuoi.
 
 ---
 

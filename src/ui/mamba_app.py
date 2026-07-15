@@ -155,12 +155,14 @@ with train_tab:
     epochs = col4.number_input("epochs", 1, 500, 80)
     batch_size = col5.selectbox("batch size", [4, 8, 16, 32], index=1)
     patience = col6.number_input("early-stop patience", 1, 50, 10)
+    train_all = st.checkbox(
+        "Train all TaskTracker sessions (no validation/early stopping)", value=False
+    )
 
     if not SPLITS_PATH.is_file():
         st.info("Prepare data and create the split first.")
     elif st.button("Train Mamba", type="primary"):
-        output, return_code = run_command(
-            [
+        train_command = [
                 "-m",
                 "src.models.mamba_model",
                 "train",
@@ -177,7 +179,9 @@ with train_tab:
                 "--patience",
                 str(int(patience)),
             ]
-        )
+        if train_all:
+            train_command.append("--train-all")
+        output, return_code = run_command(train_command)
         st.code(output, language="text")
         if return_code == 0:
             st.success("Best validation checkpoint saved.")
