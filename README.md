@@ -23,6 +23,12 @@ python -m src.models.mamba_model train --train-all --epochs 80 --batch-size 8
 python -m src.models.mamba_model test
 ```
 
+Model input chi gom 5 feature co o ca hai dataset: `is_type`, `is_paste`,
+`is_cut`, `log_len`, `log_delta_time`. Nguon paste duoc xuat trong bang giai
+thich nhung khong dua vao model, vi TaskTracker khong cung cap nguon paste tuong
+duong PasteTrace. `cheat_probability` la sigmoid score; mac dinh score >= 0.5
+thi du doan CHEAT.
+
 Output:
 
 ```text

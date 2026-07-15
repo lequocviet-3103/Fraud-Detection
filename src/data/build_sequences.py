@@ -33,11 +33,7 @@ FEATURE_NAMES = [
     "is_paste",
     "is_cut",
     "log_len",
-    "src_external",
-    "src_own",
-    "src_same_machine",
-    "src_unknown",
-    "delta_time",
+    "log_delta_time",
 ]
 
 
@@ -87,7 +83,7 @@ def _load_sessions(normalized_dir: Path) -> dict[str, tuple[Path, dict]]:
 
 
 def extract_normalized_sequence(record: dict) -> tuple[list[list[float]], bool]:
-    """Convert one normalized session record into the nine Mamba features."""
+    """Convert one normalized session record into five cross-source features."""
     sequence: list[list[float]] = []
     previous_time: float | None = None
     time_available = False
@@ -106,17 +102,6 @@ def extract_normalized_sequence(record: dict) -> tuple[list[list[float]], bool]:
         text = event.get("text")
         if not isinstance(text, str):
             text = "" if text is None else str(text)
-
-        source = str(event.get("paste_source") or "").strip().lower()
-        src_external = float(event_type == "paste" and source == "external")
-        src_own = float(event_type == "paste" and source == "own")
-        src_same_machine = float(
-            event_type == "paste" and source == "same_machine"
-        )
-        src_unknown = float(
-            event_type == "paste"
-            and source not in {"external", "own", "same_machine"}
-        )
 
         try:
             current_time = float(event.get("t"))
@@ -138,15 +123,64 @@ def extract_normalized_sequence(record: dict) -> tuple[list[list[float]], bool]:
                 float(event_type == "paste"),
                 float(event_type == "cut"),
                 math.log1p(len(text)),
-                src_external,
-                src_own,
-                src_same_machine,
-                src_unknown,
-                delta_time,
+                math.log1p(delta_time),
             ]
         )
 
     return sequence, time_available
+
+
+def summarize_normalized_events(record: dict) -> dict[str, int | float]:
+    """Return human-readable aggregates; these are not model input features."""
+    summary: dict[str, int | float] = {
+        "type_events": 0,
+        "paste_events": 0,
+        "cut_events": 0,
+        "external_paste_events": 0,
+        "own_paste_events": 0,
+        "same_machine_paste_events": 0,
+        "unknown_paste_events": 0,
+        "typed_chars": 0,
+        "pasted_chars": 0,
+        "cut_chars": 0,
+        "duration_sec": 0.0,
+    }
+    timestamps: list[float] = []
+    events = record.get("events")
+    if not isinstance(events, list):
+        return summary
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "").strip().lower()
+        if event_type not in {"type", "paste", "cut"}:
+            continue
+        text = event.get("text")
+        text_len = len(text) if isinstance(text, str) else 0
+        summary[f"{event_type}_events"] += 1
+        char_key = {"type": "typed_chars", "paste": "pasted_chars", "cut": "cut_chars"}[event_type]
+        summary[char_key] += text_len
+
+        if event_type == "paste":
+            source = str(event.get("paste_source") or "").strip().lower()
+            source_key = {
+                "external": "external_paste_events",
+                "own": "own_paste_events",
+                "same_machine": "same_machine_paste_events",
+            }.get(source, "unknown_paste_events")
+            summary[source_key] += 1
+
+        try:
+            timestamp = float(event.get("t"))
+            if math.isfinite(timestamp):
+                timestamps.append(timestamp)
+        except (TypeError, ValueError):
+            pass
+
+    if timestamps:
+        summary["duration_sec"] = max(0.0, max(timestamps) - min(timestamps))
+    return summary
 
 
 def _safe_id(dataset_name: str, source_path: Path) -> str:
@@ -196,6 +230,7 @@ def build_dataset_sequences(
             "n_events": len(sequence),
             "time_available": time_available,
             "feature_names": FEATURE_NAMES,
+            "behavior_summary": summarize_normalized_events(record),
             "seq": sequence,
         }
         with output_path.open("w", encoding="utf8") as handle:

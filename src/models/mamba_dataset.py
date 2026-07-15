@@ -12,8 +12,8 @@ import torch
 from torch.utils.data import Dataset
 
 SCALER_PATH = os.path.join("models", "mamba", "scaler.json")
-# Indices of continuous features that need scaling (log_len=3, delta_time=8)
-CONTINUOUS_IDXS = [3, 8]
+# Indices of continuous features that need scaling (log_len=3, log_delta_time=4)
+CONTINUOUS_IDXS = [3, 4]
 
 
 class SequenceScaler:

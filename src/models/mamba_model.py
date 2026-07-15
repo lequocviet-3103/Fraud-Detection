@@ -45,12 +45,11 @@ D_MODEL = 64
 N_LAYERS = 2
 DROPOUT = 0.2
 EPOCHS = 80
-LR = 1e-3
+LR = 3e-4
 WEIGHT_DECAY = 0.01
 PATIENCE = 10
 BATCH_SIZE = 8
 MAX_LEN = 1000
-SAME_MACHINE_FEATURE_IDX = 6
 
 
 def _import_mamba():
@@ -88,11 +87,6 @@ class MambaClassifier(nn.Module):
     ):
         super().__init__()
         self.input_proj = nn.Linear(n_features, d_model)
-        # TaskTracker has no same_machine source. Start this unseen feature at
-        # zero influence; it can still learn if future training data contains it.
-        if n_features > SAME_MACHINE_FEATURE_IDX:
-            with torch.no_grad():
-                self.input_proj.weight[:, SAME_MACHINE_FEATURE_IDX].zero_()
         self.blocks = nn.Sequential(
             *[MambaBlock(d_model) for _ in range(n_layers)]
         )
@@ -129,12 +123,18 @@ def _run_epoch(
             mask = mask.to(device)
             labels = labels.to(device)
             logits = model(padded, mask)
+            if not torch.isfinite(logits).all():
+                raise FloatingPointError("Model logits became NaN/Inf")
             loss = criterion(logits, labels)
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Loss became NaN/Inf")
 
             if optimizer is not None:
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if not torch.isfinite(grad_norm):
+                    raise FloatingPointError("Gradient norm became NaN/Inf")
                 optimizer.step()
 
             total_loss += loss.item() * len(labels)
@@ -152,6 +152,11 @@ def _run_epoch(
 def _metrics(
     y_true: list[int], y_pred: list[int], y_prob: list[float]
 ) -> dict[str, float | int | list[list[int]] | None]:
+    if not np.all(np.isfinite(np.asarray(y_prob, dtype=float))):
+        raise ValueError(
+            "Prediction scores contain NaN/Inf. The saved checkpoint is invalid; "
+            "retrain the model."
+        )
     precision, recall, f1, support = precision_recall_fscore_support(
         y_true, y_pred, labels=[0, 1], zero_division=0
     )
@@ -181,6 +186,11 @@ def _metrics(
 def _read_index(index_path: Path) -> dict[str, dict[str, str]]:
     with index_path.open(encoding="utf8", newline="") as handle:
         return {row["id"]: row for row in csv.DictReader(handle)}
+
+
+def _read_sequence_record(sequence_dir: Path, sample_id: str) -> dict:
+    with (sequence_dir / f"{sample_id}.json").open(encoding="utf8") as handle:
+        return json.load(handle)
 
 
 def _required_training_inputs() -> dict:
@@ -270,6 +280,13 @@ def cmd_train(args: argparse.Namespace) -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(args.epochs, 1), eta_min=args.lr * 0.05
+        )
+        if train_all
+        else None
+    )
 
     if train_all:
         print(
@@ -291,15 +308,47 @@ def cmd_train(args: argparse.Namespace) -> None:
     model_path = os.path.join(MODEL_DIR, "mamba.pt")
     best_f1 = -1.0
     best_loss = float("inf")
+    best_train_loss = float("inf")
     best_epoch = 0
     stale_epochs = 0
+    stopped_reason = "completed"
+    history_rows: list[dict] = []
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, *_ = _run_epoch(
-            model, train_loader, device, criterion, optimizer
-        )
+        current_lr = float(optimizer.param_groups[0]["lr"])
+        try:
+            train_loss, *_ = _run_epoch(
+                model, train_loader, device, criterion, optimizer
+            )
+        except FloatingPointError as exc:
+            stopped_reason = f"non_finite: {exc}"
+            print(f"[STOP] {stopped_reason}. Restoring best finite checkpoint.")
+            break
+
         if train_all:
             print(f"{epoch:5d} {train_loss:10.4f}")
+            history_rows.append(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "val_loss": None,
+                    "val_macro_f1": None,
+                    "learning_rate": current_lr,
+                }
+            )
+            if train_loss < best_train_loss:
+                torch.save(model.state_dict(), model_path)
+                best_train_loss = train_loss
+                best_epoch = epoch
+            elif train_loss > max(100.0, best_train_loss * 1000.0):
+                stopped_reason = "loss_explosion"
+                print(
+                    "[STOP] Training loss exploded. "
+                    "Restoring the lowest finite-loss checkpoint."
+                )
+                break
+            assert scheduler is not None
+            scheduler.step()
             continue
 
         assert val_loader is not None
@@ -308,6 +357,15 @@ def cmd_train(args: argparse.Namespace) -> None:
         )
         val_f1 = float(_metrics(val_true, val_pred, val_prob)["macro_f1"])
         print(f"{epoch:5d} {train_loss:10.4f} {val_loss:10.4f} {val_f1:11.4f}")
+        history_rows.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_macro_f1": val_f1,
+                "learning_rate": current_lr,
+            }
+        )
 
         improved = val_f1 > best_f1 + 1e-6 or (
             abs(val_f1 - best_f1) <= 1e-6 and val_loss < best_loss
@@ -321,14 +379,32 @@ def cmd_train(args: argparse.Namespace) -> None:
         else:
             stale_epochs += 1
             if stale_epochs >= args.patience:
+                stopped_reason = "early_stopping"
                 print(f"Early stopping tai epoch {epoch}.")
                 break
 
     if train_all:
-        torch.save(model.state_dict(), model_path)
-        best_epoch = args.epochs
         best_f1 = None
         best_loss = None
+        if best_epoch == 0:
+            raise SystemExit("[ERROR] Training failed before a finite checkpoint was saved.")
+    elif best_epoch == 0:
+        raise SystemExit("[ERROR] Training failed before a validation checkpoint was saved.")
+
+    history_path = Path(MODEL_DIR) / "training_history.csv"
+    with history_path.open("w", encoding="utf8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "epoch",
+                "train_loss",
+                "val_loss",
+                "val_macro_f1",
+                "learning_rate",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(history_rows)
 
     majority_class = int(positives >= negatives)
     config = {
@@ -341,6 +417,12 @@ def cmd_train(args: argparse.Namespace) -> None:
         "best_epoch": best_epoch,
         "best_val_macro_f1": best_f1,
         "best_val_loss": best_loss,
+        "best_train_loss": best_train_loss if train_all else None,
+        "decision_threshold": 0.5,
+        "epochs_requested": args.epochs,
+        "epochs_completed": len(history_rows),
+        "stopped_reason": stopped_reason,
+        "scheduler": "cosine" if train_all else "none",
         "training_mode": "all_tasktracker" if train_all else "train_val",
         "n_train_samples": len(train_dataset),
         "n_val_samples": 0 if val_dataset is None else len(val_dataset),
@@ -355,9 +437,13 @@ def cmd_train(args: argparse.Namespace) -> None:
     with open(os.path.join(MODEL_DIR, "config.json"), "w", encoding="utf8") as handle:
         json.dump(config, handle, indent=2, ensure_ascii=False)
     if train_all:
-        print(f"Final model saved -> {model_path} (epoch={best_epoch})")
+        print(
+            f"Best finite model saved -> {model_path} "
+            f"(epoch={best_epoch}, train_loss={best_train_loss:.6f})"
+        )
     else:
         print(f"Best model saved -> {model_path} (epoch={best_epoch})")
+    print(f"Training history -> {history_path}")
 
 
 def _load_model_and_scaler(device: torch.device):
@@ -388,6 +474,17 @@ def _load_model_and_scaler(device: torch.device):
     except RuntimeError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc
     state = torch.load(paths["model"], map_location=device)
+    invalid_tensors = [
+        name
+        for name, tensor in state.items()
+        if torch.is_tensor(tensor) and not torch.isfinite(tensor).all()
+    ]
+    if invalid_tensors:
+        preview = ", ".join(invalid_tensors[:5])
+        raise SystemExit(
+            "[ERROR] Saved model contains NaN/Inf parameters "
+            f"({preview}). Retrain before testing."
+        )
     model.load_state_dict(state)
     model.to(device).eval()
     return model, scaler, config
@@ -416,9 +513,11 @@ def cmd_test(_args: argparse.Namespace) -> None:
         collate_fn=collate_fn,
     )
     criterion = nn.BCEWithLogitsLoss()
-    test_loss, y_true, y_pred, y_prob, ordered_ids = _run_epoch(
+    test_loss, y_true, _default_pred, y_prob, ordered_ids = _run_epoch(
         model, test_loader, device, criterion
     )
+    threshold = float(config.get("decision_threshold", 0.5))
+    y_pred = (np.asarray(y_prob) >= threshold).astype(int).tolist()
     metrics = _metrics(y_true, y_pred, y_prob)
     metrics["loss"] = float(test_loss)
     metrics["n_samples"] = len(y_true)
@@ -433,13 +532,22 @@ def cmd_test(_args: argparse.Namespace) -> None:
     for sample_id, truth, pred, probability in zip(
         ordered_ids, y_true, y_pred, y_prob
     ):
+        sequence_record = _read_sequence_record(TEST_SEQ_DIR, sample_id)
+        summary = sequence_record.get("behavior_summary", {})
         predictions.append(
             {
                 "id": sample_id,
                 "session_id": index.get(sample_id, {}).get("session_id", sample_id),
                 "true_label": truth,
+                "true_label_name": "CHEAT" if truth else "NORMAL",
                 "predicted_label": pred,
+                "predicted_label_name": "CHEAT" if pred else "NORMAL",
+                "cheat_score": probability,
                 "cheat_probability": probability,
+                "decision_threshold": threshold,
+                "correct": int(truth == pred),
+                "n_events": sequence_record.get("n_events", 0),
+                **summary,
             }
         )
 
@@ -447,6 +555,16 @@ def cmd_test(_args: argparse.Namespace) -> None:
     result = {
         "train_source": "tasktracker",
         "test_source": "pastetrace",
+        "input_features": config.get("feature_names", []),
+        "score_definition": (
+            "cheat_score = sigmoid(model_logit); it is a decision score in [0,1], "
+            "not a calibrated real-world probability"
+        ),
+        "decision_rule": f"CHEAT when sigmoid(logit) >= {threshold}",
+        "label_usage": (
+            "labels.csv is used only for loss during training and metrics during "
+            "testing; labels are never included in the model input sequence"
+        ),
         "mamba": metrics,
         "majority_baseline": baseline,
         "predictions": predictions,
@@ -467,6 +585,15 @@ def cmd_test(_args: argparse.Namespace) -> None:
     print(f"Cheat F1 : {metrics['cheat_f1']:.4f}")
     print(f"Normal F1: {metrics['normal_f1']:.4f}")
     print(f"Results  : {result_path}")
+    print("\nPer-session predictions:")
+    for row in predictions:
+        print(
+            f"  {row['session_id']:<30} "
+            f"true={row['true_label_name']:<6} "
+            f"pred={row['predicted_label_name']:<6} "
+            f"score={row['cheat_probability']:.4f} "
+            f"threshold={threshold:.2f}"
+        )
 
 
 def cmd_predict(args: argparse.Namespace) -> dict:
@@ -488,11 +615,12 @@ def cmd_predict(args: argparse.Namespace) -> dict:
     mask = torch.ones(1, tensor.shape[1], dtype=torch.bool, device=device)
     with torch.no_grad():
         probability = float(torch.sigmoid(model(tensor, mask)).item())
-    label = int(probability >= 0.5)
+    threshold = float(config.get("decision_threshold", 0.5))
+    label = int(probability >= threshold)
     label_name = "CHEAT" if label else "NORMAL"
     print(
         f"Prediction: {label_name} "
-        f"(prob={probability:.4f}, events={len(scaled)})"
+        f"(score={probability:.4f}, threshold={threshold:.2f}, events={len(scaled)})"
     )
     return {"label": label, "label_name": label_name, "prob": probability}
 
