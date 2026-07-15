@@ -5,6 +5,44 @@ Ket hop hai nhanh: phan tich **code text** (CodeBERT) va phan tich **hanh vi go 
 
 ---
 
+## Mamba: TaskTracker train, PasteTrace test
+
+Luong Mamba moi dung hai bo du lieu normalized va co dinh vai tro de tranh data leakage:
+
+- `tasktracker/normalized/`: train va validation.
+- `pastetrace/normalized/`: external test duy nhat.
+- Scaler chi duoc fit tren TaskTracker train split.
+- PasteTrace khong duoc dung de fit scaler, train model hoac chon checkpoint.
+
+Chay CLI:
+
+```bash
+python -m src.data.build_sequences --train-dir tasktracker --test-dir pastetrace --min-events 1
+python -m src.data.make_splits --val 0.15 --seed 42
+python -m src.models.mamba_model train --epochs 80 --batch-size 8
+python -m src.models.mamba_model test
+```
+
+Output:
+
+```text
+data/mamba/train_sequences/    # TaskTracker
+data/mamba/test_sequences/     # PasteTrace
+models/mamba/mamba.pt
+results/mamba_metrics.json
+results/mamba_predictions.csv
+```
+
+Dashboard rieng cho Mamba:
+
+```bash
+streamlit run src/ui/mamba_app.py
+```
+
+Notebook GPU: `notebooks/mamba_colab.ipynb`.
+
+---
+
 ## Yeu cau he thong
 
 | | |
@@ -301,9 +339,8 @@ FraudDetection3Model/
 ├── models/                      # Trained models (auto-generated)
 │   ├── fusion_xgb.pkl           # XGBoost saved model
 │   └── svm/
-├── scripts/
-│   └── create_test_cohort.py    # Tao synthetic test data
-├── test_new_cohort/             # Test data co nhan
+├── tasktracker/                 # Mamba train/validation data (normalized)
+├── pastetrace/                  # Mamba external test data (normalized)
 ├── requirements.txt
 ├── guide.md                     # Giai thich chi tiet source code
 └── README.md

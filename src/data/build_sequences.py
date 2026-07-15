@@ -1,217 +1,295 @@
-"""Extract behavioral event sequences from meta.json files.
+"""Build Mamba event sequences from the normalized datasets.
 
-Each student -> [n_events x 8] feature matrix saved as JSON.
-Features per event: is_type, is_paste, is_cut, log_len, src_external, src_same, src_other, delta_time
-Skips L="O" (scaffold code) and any other non-{T,P,C} events.
+The data roles are intentionally fixed by default:
+
+* ``tasktracker/`` is the training/validation dataset.
+* ``pastetrace/`` is the external test dataset.
+
+Both folders must contain ``normalized/labels.csv`` and one JSON file per
+session.  No data from the external test set is used while fitting the scaler
+or the model.
 """
+
+from __future__ import annotations
+
 import argparse
-import base64
 import csv
 import json
 import math
 import os
-import struct
-
-CASE_STUDY_ROOT = "test_new_cohort"
-OUTPUT_DIR = os.path.join("data", "train_sequences")
-INDEX_PATH = os.path.join("data", "sequences_index.csv")
-FEATURE_NAMES = ["is_type", "is_paste", "is_cut", "log_len", "src_external", "src_same", "src_other", "delta_time"]
+from pathlib import Path
 
 
-def _decode_time(t_val):
-    """Decode PasteTrace base64-encoded long timestamp -> ms (int). Returns None on failure."""
-    if not t_val:
-        return None
-    try:
-        raw = base64.b64decode(t_val + "==")
-        if len(raw) >= 8:
-            return struct.unpack(">q", raw[:8])[0]
-    except Exception:
-        pass
-    try:
-        return int(t_val)
-    except Exception:
-        return None
+TRAIN_DATA_ROOT = "tasktracker"
+TEST_DATA_ROOT = "pastetrace"
+MAMBA_DATA_DIR = Path("data") / "mamba"
+TRAIN_OUTPUT_DIR = MAMBA_DATA_DIR / "train_sequences"
+TEST_OUTPUT_DIR = MAMBA_DATA_DIR / "test_sequences"
+TRAIN_INDEX_PATH = MAMBA_DATA_DIR / "train_index.csv"
+TEST_INDEX_PATH = MAMBA_DATA_DIR / "test_index.csv"
+
+FEATURE_NAMES = [
+    "is_type",
+    "is_paste",
+    "is_cut",
+    "log_len",
+    "src_external",
+    "src_own",
+    "src_same_machine",
+    "src_unknown",
+    "delta_time",
+]
 
 
-def _paste_source(note: str):
-    """Return (src_external, src_same, src_other) one-hot from paste note N."""
-    n = (note or "").lower()
-    if "noncoded source" in n:
-        return 1, 0, 0
-    if any(kw in n for kw in ("same machine", "same creator", "internal paste", "paste from project")):
-        return 0, 1, 0
-    if "uuid" in n or "paste" in n:
-        return 0, 0, 1
-    return 0, 0, 1  # unknown paste origin -> other
+def _normalized_dir(data_root: str | os.PathLike[str]) -> Path:
+    """Return the directory that directly contains labels.csv and JSON files."""
+    root = Path(data_root)
+    nested = root / "normalized"
+    if (nested / "labels.csv").is_file():
+        return nested
+    if (root / "labels.csv").is_file():
+        return root
+    raise FileNotFoundError(
+        f"Khong tim thay labels.csv trong '{root}' hoac '{nested}'."
+    )
 
 
-def extract_sequence(meta_paths: list[str]) -> tuple[list[list[float]], bool]:
-    """Return (seq, time_available) from one or more meta.json paths."""
-    all_events = []
-    for path in meta_paths:
-        try:
-            with open(path, encoding="utf8", errors="ignore") as f:
-                data = json.load(f)
-            all_events.extend(data.get("History", []))
-        except Exception:
-            pass
-
-    seq = []
-    prev_ts = None
-    time_available = False
-
-    for ev in all_events:
-        L = ev.get("L", "")
-        if L not in ("T", "P", "C"):
-            continue  # skip L="O" scaffold and others
-
-        is_type = 1.0 if L == "T" else 0.0
-        is_paste = 1.0 if L == "P" else 0.0
-        is_cut = 1.0 if L == "C" else 0.0
-
-        text = ev.get("E", "")
-        log_len = math.log1p(len(text))
-
-        if L == "P":
-            src_e, src_s, src_o = _paste_source(ev.get("N", ""))
-        else:
-            src_e, src_s, src_o = 0.0, 0.0, 0.0
-
-        ts = _decode_time(ev.get("T"))
-        if ts is not None and prev_ts is not None:
-            delta = max(0.0, float(ts - prev_ts))
-            time_available = True
-        else:
-            delta = 0.0
-        if ts is not None:
-            prev_ts = ts
-
-        seq.append([is_type, is_paste, is_cut, log_len, float(src_e), float(src_s), float(src_o), delta])
-
-    return seq, time_available
-
-
-def _find_meta_jsons(student_dir: str) -> list[str]:
-    paths = []
-    for root, _, files in os.walk(student_dir):
-        for name in files:
-            if name == "meta.json":
-                paths.append(os.path.join(root, name))
-    return paths
-
-
-def _load_labels(case_dir: str) -> dict[str, int]:
-    agg_path = os.path.join(case_dir, "agrigation.csv")
-    labels = {}
-    with open(agg_path, encoding="utf8", errors="ignore") as f:
-        for row in csv.DictReader(f):
-            student = row.get("Student", "").strip()
-            if not student:
+def _load_labels(normalized_dir: Path, subset: str = "all") -> dict[str, int]:
+    labels: dict[str, int] = {}
+    with (normalized_dir / "labels.csv").open(
+        encoding="utf8", errors="ignore", newline=""
+    ) as handle:
+        for row in csv.DictReader(handle):
+            session_id = (row.get("session_id") or "").strip()
+            raw_label = (row.get("label") or "").strip()
+            if not session_id or raw_label not in {"0", "1"}:
                 continue
-            cheated = (row.get("Cheated") or "").strip()
-            if cheated == "X":
-                labels[student] = 1
-            elif cheated == "":
-                labels[student] = 0
-            # ? and * -> excluded
+            if subset == "original16" and (
+                row.get("in_original_16") or ""
+            ).strip().lower() != "yes":
+                continue
+            labels[session_id] = int(raw_label)
     return labels
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Build behavioral event sequences from PasteTrace meta.json")
-    parser.add_argument("--data-dir", default=None, help="Path to pre-processed folder")
-    parser.add_argument("--output-dir", default=OUTPUT_DIR)
-    parser.add_argument("--min-events", type=int, default=3, help="Drop students with fewer events")
+def _load_sessions(normalized_dir: Path) -> dict[str, tuple[Path, dict]]:
+    sessions: dict[str, tuple[Path, dict]] = {}
+    for path in sorted(normalized_dir.glob("*.json")):
+        try:
+            with path.open(encoding="utf8", errors="ignore") as handle:
+                record = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        session_id = str(record.get("session_id") or "").strip()
+        if session_id:
+            sessions[session_id] = (path, record)
+    return sessions
+
+
+def extract_normalized_sequence(record: dict) -> tuple[list[list[float]], bool]:
+    """Convert one normalized session record into the nine Mamba features."""
+    sequence: list[list[float]] = []
+    previous_time: float | None = None
+    time_available = False
+
+    events = record.get("events")
+    if not isinstance(events, list):
+        return sequence, time_available
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "").strip().lower()
+        if event_type not in {"type", "paste", "cut"}:
+            continue
+
+        text = event.get("text")
+        if not isinstance(text, str):
+            text = "" if text is None else str(text)
+
+        source = str(event.get("paste_source") or "").strip().lower()
+        src_external = float(event_type == "paste" and source == "external")
+        src_own = float(event_type == "paste" and source == "own")
+        src_same_machine = float(
+            event_type == "paste" and source == "same_machine"
+        )
+        src_unknown = float(
+            event_type == "paste"
+            and source not in {"external", "own", "same_machine"}
+        )
+
+        try:
+            current_time = float(event.get("t"))
+            if not math.isfinite(current_time):
+                current_time = None
+        except (TypeError, ValueError):
+            current_time = None
+
+        delta_time = 0.0
+        if current_time is not None and previous_time is not None:
+            delta_time = max(0.0, current_time - previous_time)
+            time_available = True
+        if current_time is not None:
+            previous_time = current_time
+
+        sequence.append(
+            [
+                float(event_type == "type"),
+                float(event_type == "paste"),
+                float(event_type == "cut"),
+                math.log1p(len(text)),
+                src_external,
+                src_own,
+                src_same_machine,
+                src_unknown,
+                delta_time,
+            ]
+        )
+
+    return sequence, time_available
+
+
+def _safe_id(dataset_name: str, source_path: Path) -> str:
+    return f"{dataset_name}_{source_path.stem}"
+
+
+def build_dataset_sequences(
+    data_root: str | os.PathLike[str],
+    output_dir: str | os.PathLike[str],
+    index_path: str | os.PathLike[str],
+    dataset_name: str,
+    min_events: int = 1,
+    subset: str = "all",
+) -> list[dict]:
+    """Build one dataset and return its index rows."""
+    normalized_dir = _normalized_dir(data_root)
+    labels = _load_labels(normalized_dir, subset=subset)
+    sessions = _load_sessions(normalized_dir)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict] = []
+    skipped: list[str] = []
+    current_files: set[str] = set()
+
+    for session_id, label in sorted(labels.items()):
+        loaded = sessions.get(session_id)
+        if loaded is None:
+            skipped.append(f"{session_id}: khong tim thay JSON")
+            continue
+        source_path, record = loaded
+        sequence, time_available = extract_normalized_sequence(record)
+        if len(sequence) < min_events:
+            skipped.append(
+                f"{session_id}: chi co {len(sequence)} event (< {min_events})"
+            )
+            continue
+
+        sample_id = _safe_id(dataset_name, source_path)
+        output_path = out_dir / f"{sample_id}.json"
+        output_record = {
+            "id": sample_id,
+            "session_id": session_id,
+            "dataset": dataset_name,
+            "source": record.get("source", dataset_name),
+            "label": label,
+            "n_events": len(sequence),
+            "time_available": time_available,
+            "feature_names": FEATURE_NAMES,
+            "seq": sequence,
+        }
+        with output_path.open("w", encoding="utf8") as handle:
+            json.dump(output_record, handle, ensure_ascii=False)
+        current_files.add(output_path.name)
+        rows.append(
+            {
+                "id": sample_id,
+                "session_id": session_id,
+                "dataset": dataset_name,
+                "label": label,
+                "n_events": len(sequence),
+                "time_available": time_available,
+                "path": output_path.as_posix(),
+            }
+        )
+
+    # Dedicated generated directories are safe to clean after a successful build.
+    for old_path in out_dir.glob("*.json"):
+        if old_path.name not in current_files:
+            old_path.unlink()
+
+    index = Path(index_path)
+    index.parent.mkdir(parents=True, exist_ok=True)
+    with index.open("w", encoding="utf8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "id",
+                "session_id",
+                "dataset",
+                "label",
+                "n_events",
+                "time_available",
+                "path",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    n_cheat = sum(row["label"] == 1 for row in rows)
+    n_normal = sum(row["label"] == 0 for row in rows)
+    lengths = sorted(row["n_events"] for row in rows)
+    print(f"\n[{dataset_name}] {len(rows)} sequences -> {out_dir}")
+    print(f"  Labels: cheat={n_cheat}, normal={n_normal}")
+    if lengths:
+        print(
+            f"  Events: min={lengths[0]}, median={lengths[len(lengths) // 2]}, "
+            f"max={lengths[-1]}"
+        )
+    if skipped:
+        print(f"  Skipped: {len(skipped)}")
+        for reason in skipped[:20]:
+            print(f"    - {reason}")
+        if len(skipped) > 20:
+            print(f"    ... va {len(skipped) - 20} session khac")
+    return rows
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Build TaskTracker train sequences and PasteTrace test sequences"
+    )
+    parser.add_argument("--train-dir", default=TRAIN_DATA_ROOT)
+    parser.add_argument("--test-dir", default=TEST_DATA_ROOT)
+    parser.add_argument("--output-root", default=str(MAMBA_DATA_DIR))
+    parser.add_argument("--min-events", type=int, default=1)
+    parser.add_argument(
+        "--test-subset", choices=("all", "original16"), default="all"
+    )
     args = parser.parse_args()
 
-    data_root = args.data_dir or CASE_STUDY_ROOT
-    out_dir = args.output_dir
-    os.makedirs(out_dir, exist_ok=True)
-
-    cases = sorted(
-        d for d in os.listdir(data_root)
-        if os.path.isdir(os.path.join(data_root, d)) and d not in ("RawData",)
-        and os.path.isfile(os.path.join(data_root, d, "agrigation.csv"))
+    output_root = Path(args.output_root)
+    train_rows = build_dataset_sequences(
+        args.train_dir,
+        output_root / "train_sequences",
+        output_root / "train_index.csv",
+        dataset_name="tasktracker",
+        min_events=args.min_events,
     )
-    if not cases:
-        print(f"[ERROR] No case folders with agrigation.csv found in: {data_root}")
-        return
+    test_rows = build_dataset_sequences(
+        args.test_dir,
+        output_root / "test_sequences",
+        output_root / "test_index.csv",
+        dataset_name="pastetrace",
+        min_events=args.min_events,
+        subset=args.test_subset,
+    )
 
-    index_rows = []
-    skipped = []
-    lengths = []
-    label_counts = {0: 0, 1: 0}
-    time_ok_count = 0
-
-    for case in cases:
-        case_dir = os.path.join(data_root, case)
-        labels = _load_labels(case_dir)
-
-        for student, label in sorted(labels.items()):
-            student_dir = os.path.join(case_dir, student)
-            if not os.path.isdir(student_dir):
-                skipped.append(f"{case}/{student}: directory not found")
-                continue
-
-            meta_paths = _find_meta_jsons(student_dir)
-            if not meta_paths:
-                skipped.append(f"{case}/{student}: no meta.json (excluded)")
-                continue
-
-            seq, time_available = extract_sequence(meta_paths)
-
-            if len(seq) < args.min_events:
-                skipped.append(f"{case}/{student}: only {len(seq)} events < min_events={args.min_events}")
-                continue
-
-            record = {
-                "case": case,
-                "student": student,
-                "label": label,
-                "n_events": len(seq),
-                "time_available": time_available,
-                "feature_names": FEATURE_NAMES,
-                "seq": seq,
-            }
-            out_name = f"{case}_{student}.json"
-            out_path = os.path.join(out_dir, out_name)
-            with open(out_path, "w", encoding="utf8") as f:
-                json.dump(record, f)
-
-            index_rows.append({
-                "id": f"{case}_{student}",
-                "case": case,
-                "student": student,
-                "label": label,
-                "n_events": len(seq),
-                "time_available": time_available,
-                "path": out_path,
-            })
-            lengths.append(len(seq))
-            label_counts[label] = label_counts.get(label, 0) + 1
-            if time_available:
-                time_ok_count += 1
-
-    with open(INDEX_PATH, "w", encoding="utf8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["id", "case", "student", "label", "n_events", "time_available", "path"])
-        writer.writeheader()
-        writer.writerows(index_rows)
-
-    total = len(index_rows)
-    print(f"\nBuilt {total} sequences -> {out_dir}")
-    print(f"  Labels : cheat={label_counts.get(1,0)}, normal={label_counts.get(0,0)}")
-    if lengths:
-        lengths.sort()
-        med = lengths[len(lengths)//2]
-        print(f"  Events : min={lengths[0]}, median={med}, max={lengths[-1]}")
-    print(f"  Time field available in {time_ok_count}/{total} students")
-    print(f"  Features: {FEATURE_NAMES}")
-
-    if skipped:
-        print(f"\nSkipped ({len(skipped)}):")
-        for s in skipped:
-            print(f"  {s}")
+    if not train_rows:
+        raise SystemExit("[ERROR] TaskTracker khong co sequence hop le de train.")
+    if not test_rows:
+        raise SystemExit("[ERROR] PasteTrace khong co sequence hop le de test.")
+    print("\nDa chuan bi xong: TaskTracker=train, PasteTrace=external test.")
 
 
 if __name__ == "__main__":

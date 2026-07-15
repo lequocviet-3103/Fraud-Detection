@@ -1,7 +1,7 @@
 """PyTorch Dataset + collate for variable-length behavioral event sequences.
 
-Scaler is fit ONLY on train split and saved to models/mamba/scaler.json
-to prevent data leakage into val/test.
+The scaler is fit only on the TaskTracker training split and saved to
+``models/mamba/scaler.json``. PasteTrace is transformed with that frozen scaler.
 """
 import json
 import os
@@ -12,8 +12,8 @@ import torch
 from torch.utils.data import Dataset
 
 SCALER_PATH = os.path.join("models", "mamba", "scaler.json")
-# Indices of continuous features that need scaling (log_len=3, delta_time=7)
-CONTINUOUS_IDXS = [3, 7]
+# Indices of continuous features that need scaling (log_len=3, delta_time=8)
+CONTINUOUS_IDXS = [3, 8]
 
 
 class SequenceScaler:
@@ -67,12 +67,12 @@ class SequenceScaler:
 
 
 class SequenceDataset(Dataset):
-    """Load behavioral sequences from data/sequences/<id>.json files."""
+    """Load generated behavioral sequences by sample id."""
 
     def __init__(
         self,
         ids: list[str],
-        seq_dir: str = os.path.join("data", "sequences"),
+        seq_dir: str = os.path.join("data", "mamba", "train_sequences"),
         scaler: Optional[SequenceScaler] = None,
         max_len: int = 1000,
     ):
@@ -101,7 +101,10 @@ class SequenceDataset(Dataset):
         return self.records[idx]
 
 
-def build_scaler_from_ids(train_ids: list[str], seq_dir: str = os.path.join("data", "sequences")) -> SequenceScaler:
+def build_scaler_from_ids(
+    train_ids: list[str],
+    seq_dir: str = os.path.join("data", "mamba", "train_sequences"),
+) -> SequenceScaler:
     """Fit scaler on raw (unscaled) train sequences only."""
     seqs = []
     for sid in train_ids:

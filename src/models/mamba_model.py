@@ -1,37 +1,46 @@
-"""MambaClassifier for behavioral event sequences.
+"""Mamba classifier for normalized behavioral event sequences.
 
-Modes:
-  python -m src.models.mamba_model train   [options]
-  python -m src.models.mamba_model test
-  python -m src.models.mamba_model predict <meta_json_path>
-  python -m src.models.mamba_model train --loo   (Leave-One-Out fallback)
+Commands::
 
-Requirements (GPU only):
-  pip install mamba-ssm causal-conv1d
-  (See requirements-mamba.txt)
+    python -m src.models.mamba_model train
+    python -m src.models.mamba_model test
+    python -m src.models.mamba_model predict pastetrace/normalized/111_A.json
 
-WARNING: The TEST command evaluates on held-out data that was never used for
-tuning. Run it ONCE at the very end. Do not use test metrics to adjust
-hyperparameters — that invalidates the evaluation.
+Training and validation use TaskTracker only. ``test`` evaluates the frozen
+model on PasteTrace, which is kept as a fully external test dataset.
 """
+
+from __future__ import annotations
+
 import argparse
+import csv
 import json
-import math
 import os
 import sys
-import time
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_recall_fscore_support,
+    roc_auc_score,
+)
 from torch.utils.data import DataLoader
 
-SPLITS_PATH = os.path.join("data", "splits.json")
-SEQ_DIR = os.path.join("data", "train_sequences")
-INDEX_PATH = os.path.join("data", "sequences_index.csv")
-MODEL_DIR = os.path.join("models", "mamba")
 
-# ── Defaults ────────────────────────────────────────────────────────────────
+MAMBA_DATA_DIR = Path("data") / "mamba"
+SPLITS_PATH = MAMBA_DATA_DIR / "splits.json"
+TRAIN_SEQ_DIR = MAMBA_DATA_DIR / "train_sequences"
+TEST_SEQ_DIR = MAMBA_DATA_DIR / "test_sequences"
+TRAIN_INDEX_PATH = MAMBA_DATA_DIR / "train_index.csv"
+TEST_INDEX_PATH = MAMBA_DATA_DIR / "test_index.csv"
+MODEL_DIR = os.path.join("models", "mamba")
+RESULTS_DIR = Path("results")
+
 D_MODEL = 64
 N_LAYERS = 2
 DROPOUT = 0.2
@@ -41,235 +50,439 @@ WEIGHT_DECAY = 0.01
 PATIENCE = 10
 BATCH_SIZE = 8
 MAX_LEN = 1000
+SAME_MACHINE_FEATURE_IDX = 6
 
 
-# ── Mamba import with helpful error ──────────────────────────────────────────
 def _import_mamba():
     try:
         from mamba_ssm import Mamba
+
         return Mamba
-    except ImportError:
-        sys.exit(
-            "[ERROR] mamba-ssm not installed or no CUDA GPU available.\n"
-            "Mamba requires a NVIDIA GPU with CUDA.\n"
-            "Install:\n"
-            "  pip install mamba-ssm causal-conv1d\n"
-            "On Google Colab/Kaggle GPU runtime this works out-of-the-box.\n"
-            "CPU-only machines cannot run Mamba."
-        )
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "Khong import duoc mamba-ssm. Hay dung moi truong GPU NVIDIA/CUDA "
+            "va cai requirements-mamba.txt."
+        ) from exc
 
 
-# ── Model ────────────────────────────────────────────────────────────────────
 class MambaBlock(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
-        Mamba = _import_mamba()
+        mamba_class = _import_mamba()
         self.norm = nn.LayerNorm(d_model)
-        self.mamba = Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2)
+        self.mamba = mamba_class(
+            d_model=d_model, d_state=16, d_conv=4, expand=2
+        )
 
-    def forward(self, x):
-        return x + self.mamba(self.norm(x))
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return inputs + self.mamba(self.norm(inputs))
 
 
 class MambaClassifier(nn.Module):
-    def __init__(self, n_features: int, d_model: int = D_MODEL, n_layers: int = N_LAYERS, dropout: float = DROPOUT):
+    def __init__(
+        self,
+        n_features: int,
+        d_model: int = D_MODEL,
+        n_layers: int = N_LAYERS,
+        dropout: float = DROPOUT,
+    ):
         super().__init__()
         self.input_proj = nn.Linear(n_features, d_model)
-        self.blocks = nn.Sequential(*[MambaBlock(d_model) for _ in range(n_layers)])
+        # TaskTracker has no same_machine source. Start this unseen feature at
+        # zero influence; it can still learn if future training data contains it.
+        if n_features > SAME_MACHINE_FEATURE_IDX:
+            with torch.no_grad():
+                self.input_proj.weight[:, SAME_MACHINE_FEATURE_IDX].zero_()
+        self.blocks = nn.Sequential(
+            *[MambaBlock(d_model) for _ in range(n_layers)]
+        )
         self.dropout = nn.Dropout(dropout)
         self.head = nn.Linear(d_model, 1)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """x: [B, L, F]  mask: [B, L] bool (True = valid token)"""
-        h = self.input_proj(x)            # [B, L, d_model]
-        h = self.blocks(h)                # [B, L, d_model]
-        # Masked mean pooling
-        mask_f = mask.unsqueeze(-1).float()
-        pooled = (h * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)  # [B, d_model]
-        pooled = self.dropout(pooled)
-        return self.head(pooled).squeeze(-1)  # [B]
+    def forward(self, inputs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        hidden = self.blocks(self.input_proj(inputs))
+        mask_float = mask.unsqueeze(-1).float()
+        pooled = (hidden * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(
+            min=1
+        )
+        return self.head(self.dropout(pooled)).squeeze(-1)
 
 
-
-
-# ── Train one epoch ──────────────────────────────────────────────────────────
-def _run_epoch(model, loader, device, criterion=None, optimizer=None):
-    training = criterion is not None and optimizer is not None
+def _run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> tuple[float, list[int], list[int], list[float], list[str]]:
+    training = optimizer is not None
     model.train(training)
     total_loss = 0.0
-    y_true, y_pred, y_prob = [], [], []
+    y_true: list[int] = []
+    y_pred: list[int] = []
+    y_prob: list[float] = []
+    sample_ids: list[str] = []
 
     with torch.set_grad_enabled(training):
-        for padded, lengths, mask, ids, labels in loader:
+        for padded, _lengths, mask, ids, labels in loader:
             padded = padded.to(device)
             mask = mask.to(device)
             labels = labels.to(device)
-
             logits = model(padded, mask)
-            if training:
-                loss = criterion(logits, labels)
+            loss = criterion(logits, labels)
+
+            if optimizer is not None:
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                total_loss += loss.item() * len(labels)
 
-            probs = torch.sigmoid(logits).detach().cpu().numpy()
-            preds = (probs >= 0.5).astype(int)
-            y_true.extend(labels.cpu().numpy().tolist())
-            y_pred.extend(preds.tolist())
-            y_prob.extend(probs.tolist())
+            total_loss += loss.item() * len(labels)
+            probabilities = torch.sigmoid(logits).detach().cpu().numpy()
+            predictions = (probabilities >= 0.5).astype(int)
+            y_true.extend(labels.detach().cpu().numpy().astype(int).tolist())
+            y_pred.extend(predictions.tolist())
+            y_prob.extend(probabilities.astype(float).tolist())
+            sample_ids.extend(ids)
 
-    avg_loss = total_loss / max(len(loader.dataset), 1) if training else 0.0
-    return avg_loss, y_true, y_pred, y_prob
+    average_loss = total_loss / max(len(loader.dataset), 1)
+    return average_loss, y_true, y_pred, y_prob, sample_ids
 
 
-# ── TRAIN mode ────────────────────────────────────────────────────────────────
-def cmd_train(args):
-    from src.models.mamba_dataset import SequenceDataset, build_scaler_from_ids, collate_fn
-    import pandas as pd
+def _metrics(
+    y_true: list[int], y_pred: list[int], y_prob: list[float]
+) -> dict[str, float | int | list[list[int]] | None]:
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true, y_pred, labels=[0, 1], zero_division=0
+    )
+    result: dict[str, float | int | list[list[int]] | None] = {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "normal_precision": float(precision[0]),
+        "normal_recall": float(recall[0]),
+        "normal_f1": float(f1[0]),
+        "normal_support": int(support[0]),
+        "cheat_precision": float(precision[1]),
+        "cheat_recall": float(recall[1]),
+        "cheat_f1": float(f1[1]),
+        "cheat_support": int(support[1]),
+        "confusion_matrix": confusion_matrix(
+            y_true, y_pred, labels=[0, 1]
+        ).astype(int).tolist(),
+    }
+    result["roc_auc"] = (
+        float(roc_auc_score(y_true, y_prob))
+        if len(set(y_true)) == 2
+        else None
+    )
+    return result
 
-    if not os.path.isfile(INDEX_PATH):
-        sys.exit(f"[ERROR] {INDEX_PATH} not found. Run build_sequences.py first.")
 
-    df = pd.read_csv(INDEX_PATH)
-    train_ids = df["id"].tolist()
+def _read_index(index_path: Path) -> dict[str, dict[str, str]]:
+    with index_path.open(encoding="utf8", newline="") as handle:
+        return {row["id"]: row for row in csv.DictReader(handle)}
+
+
+def _required_training_inputs() -> dict:
+    for path in (SPLITS_PATH, TRAIN_INDEX_PATH, TEST_INDEX_PATH):
+        if not path.is_file():
+            raise SystemExit(
+                f"[ERROR] Thieu {path}. Chay build_sequences va make_splits truoc."
+            )
+    with SPLITS_PATH.open(encoding="utf8") as handle:
+        splits = json.load(handle)
+    if splits.get("sources", {}).get("external_test") != "pastetrace":
+        raise SystemExit("[ERROR] splits.json khong khai bao PasteTrace la external test.")
+    return splits
+
+
+def cmd_train(args: argparse.Namespace) -> None:
+    from src.models.mamba_dataset import (
+        SequenceDataset,
+        build_scaler_from_ids,
+        collate_fn,
+    )
+
+    splits = _required_training_inputs()
+    train_ids = list(splits.get("train", []))
+    val_ids = list(splits.get("val", []))
+    if not train_ids or not val_ids:
+        raise SystemExit("[ERROR] Train/validation split dang rong.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    if str(device) == "cpu":
-        print("[WARNING] Mamba runs on CPU — this will be very slow and may not converge well.")
-        print("          Consider using Google Colab/Kaggle GPU runtime.")
+    if device.type == "cpu":
+        print("[WARNING] Mamba tren CPU rat cham; nen chay bang GPU CUDA.")
 
-    # Scaler fit on train only
-    scaler = build_scaler_from_ids(train_ids, SEQ_DIR)
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    scaler = build_scaler_from_ids(train_ids, str(TRAIN_SEQ_DIR))
+    Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
     scaler.save(os.path.join(MODEL_DIR, "scaler.json"))
 
-    train_ds = SequenceDataset(train_ids, SEQ_DIR, scaler=scaler, max_len=args.max_len)
+    train_dataset = SequenceDataset(
+        train_ids, str(TRAIN_SEQ_DIR), scaler=scaler, max_len=args.max_len
+    )
+    val_dataset = SequenceDataset(
+        val_ids, str(TRAIN_SEQ_DIR), scaler=scaler, max_len=args.max_len
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+    )
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              collate_fn=collate_fn, drop_last=False)
-    
-    # pos_weight from train labels
-    train_labels = np.array([item["label"].item() for item in train_ds])
-    n_pos = train_labels.sum()
-    n_neg = len(train_labels) - n_pos
-    pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32).to(device)
-    print(f"Train: {len(train_ids)} samples (cheat={int(n_pos)}, normal={int(n_neg)}), pos_weight={pos_weight.item():.2f}")
+    train_labels = np.array(
+        [int(item["label"].item()) for item in train_dataset], dtype=int
+    )
+    positives = int(train_labels.sum())
+    negatives = int(len(train_labels) - positives)
+    pos_weight = torch.tensor(
+        [negatives / max(positives, 1)], dtype=torch.float32, device=device
+    )
 
-    n_features = train_ds[0]["seq"].shape[1]
-    model = MambaClassifier(n_features, args.d_model, args.n_layers, args.dropout).to(device)
+    n_features = int(train_dataset[0]["seq"].shape[1])
+    try:
+        model = MambaClassifier(
+            n_features, args.d_model, args.n_layers, args.dropout
+        ).to(device)
+    except RuntimeError as exc:
+        raise SystemExit(f"[ERROR] {exc}") from exc
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
 
-    print(f"\nTraining {args.epochs} epochs...")
-    print(f"{'Epoch':>5} {'TrainLoss':>10}")
+    print(
+        f"TaskTracker train={len(train_dataset)}, val={len(val_dataset)} "
+        f"(train cheat={positives}, normal={negatives})"
+    )
+    print("PasteTrace khong duoc dung trong buoc train nay.")
+    print(f"{'Epoch':>5} {'TrainLoss':>10} {'ValLoss':>10} {'ValMacroF1':>11}")
+
+    model_path = os.path.join(MODEL_DIR, "mamba.pt")
+    best_f1 = -1.0
+    best_loss = float("inf")
+    best_epoch = 0
+    stale_epochs = 0
 
     for epoch in range(1, args.epochs + 1):
-        tr_loss, _, _, _ = _run_epoch(model, train_loader, device, criterion, optimizer)
-        print(f"Epoch {epoch:3d}  Loss={tr_loss:.4f}")
+        train_loss, *_ = _run_epoch(
+            model, train_loader, device, criterion, optimizer
+        )
+        val_loss, val_true, val_pred, val_prob, _ = _run_epoch(
+            model, val_loader, device, criterion
+        )
+        val_f1 = float(_metrics(val_true, val_pred, val_prob)["macro_f1"])
+        print(f"{epoch:5d} {train_loss:10.4f} {val_loss:10.4f} {val_f1:11.4f}")
 
+        improved = val_f1 > best_f1 + 1e-6 or (
+            abs(val_f1 - best_f1) <= 1e-6 and val_loss < best_loss
+        )
+        if improved:
+            torch.save(model.state_dict(), model_path)
+            best_f1 = val_f1
+            best_loss = val_loss
+            best_epoch = epoch
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+            if stale_epochs >= args.patience:
+                print(f"Early stopping tai epoch {epoch}.")
+                break
 
-       
-        torch.save(model.state_dict(), os.path.join(MODEL_DIR, "mamba.pt")
-                   )
-    cfg = {
+    majority_class = int(positives >= negatives)
+    config = {
         "n_features": n_features,
+        "feature_names": train_dataset.records[0].get("feature_names", None),
         "d_model": args.d_model,
         "n_layers": args.n_layers,
         "dropout": args.dropout,
-        "max_len": args.max_len
+        "max_len": args.max_len,
+        "best_epoch": best_epoch,
+        "best_val_macro_f1": best_f1,
+        "best_val_loss": best_loss,
+        "train_source": "tasktracker",
+        "test_source": "pastetrace",
+        "majority_class_from_train": majority_class,
     }
-    with open(os.path.join(MODEL_DIR, "config.json"), "w", encoding="utf8") as f:
-        json.dump(cfg, f, indent=2)
+    # SequenceDataset intentionally stores only model inputs, so keep names explicit.
+    from src.data.build_sequences import FEATURE_NAMES
+
+    config["feature_names"] = FEATURE_NAMES
+    with open(os.path.join(MODEL_DIR, "config.json"), "w", encoding="utf8") as handle:
+        json.dump(config, handle, indent=2, ensure_ascii=False)
+    print(f"Best model saved -> {model_path} (epoch={best_epoch})")
 
 
-
-
-
-
-# ── PREDICT mode ──────────────────────────────────────────────────────────────
-def cmd_predict(args):
+def _load_model_and_scaler(device: torch.device):
     from src.models.mamba_dataset import SequenceScaler
-    from src.data.build_sequences import extract_sequence, _find_meta_jsons
 
-    model_pt = os.path.join(MODEL_DIR, "mamba.pt")
-    cfg_path = os.path.join(MODEL_DIR, "config.json")
-    scaler_path = os.path.join(MODEL_DIR, "scaler.json")
+    paths = {
+        "model": Path(MODEL_DIR) / "mamba.pt",
+        "config": Path(MODEL_DIR) / "config.json",
+        "scaler": Path(MODEL_DIR) / "scaler.json",
+    }
+    for path in paths.values():
+        if not path.is_file():
+            raise SystemExit(f"[ERROR] Thieu {path}. Hay train model truoc.")
+    with paths["config"].open(encoding="utf8") as handle:
+        config = json.load(handle)
+    if config.get("train_source") != "tasktracker" or config.get(
+        "test_source"
+    ) != "pastetrace":
+        raise SystemExit("[ERROR] Model hien tai khong thuoc pipeline TaskTracker -> PasteTrace.")
+    scaler = SequenceScaler.load(str(paths["scaler"]))
+    try:
+        model = MambaClassifier(
+            config["n_features"],
+            config["d_model"],
+            config["n_layers"],
+            config["dropout"],
+        )
+    except RuntimeError as exc:
+        raise SystemExit(f"[ERROR] {exc}") from exc
+    state = torch.load(paths["model"], map_location=device)
+    model.load_state_dict(state)
+    model.to(device).eval()
+    return model, scaler, config
 
-    for p in [model_pt, cfg_path, scaler_path]:
-        if not os.path.isfile(p):
-            sys.exit(f"[ERROR] Missing {p}. Run 'train' first.")
 
-    path = args.input
-    if os.path.isdir(path):
-        meta_paths = _find_meta_jsons(path)
-    elif path.endswith("meta.json"):
-        meta_paths = [path]
-    else:
-        meta_paths = _find_meta_jsons(os.path.dirname(path))
+def cmd_test(_args: argparse.Namespace) -> None:
+    from src.models.mamba_dataset import SequenceDataset, collate_fn
 
-    if not meta_paths:
-        sys.exit(f"[ERROR] No meta.json found at: {path}")
-
-    seq, _ = extract_sequence(meta_paths)
-    if not seq:
-        sys.exit("[ERROR] No valid events (T/P/C) found in the meta.json.")
-
-    with open(cfg_path, encoding="utf8") as f:
-        cfg = json.load(f)
-
-    scaler = SequenceScaler.load(scaler_path)
-    seq = scaler.transform(seq[:cfg["max_len"]])
-    seq_t = torch.tensor(seq, dtype=torch.float32).unsqueeze(0)
-    mask = torch.ones(1, seq_t.shape[1], dtype=torch.bool)
+    splits = _required_training_inputs()
+    test_ids = list(splits.get("external_test", []))
+    if not test_ids:
+        raise SystemExit("[ERROR] PasteTrace external test split dang rong.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MambaClassifier(cfg["n_features"], cfg["d_model"], cfg["n_layers"], cfg["dropout"])
-    model.load_state_dict(torch.load(model_pt, map_location=device))
-    model.to(device).eval()
+    model, scaler, config = _load_model_and_scaler(device)
+    test_dataset = SequenceDataset(
+        test_ids,
+        str(TEST_SEQ_DIR),
+        scaler=scaler,
+        max_len=int(config["max_len"]),
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn,
+    )
+    criterion = nn.BCEWithLogitsLoss()
+    test_loss, y_true, y_pred, y_prob, ordered_ids = _run_epoch(
+        model, test_loader, device, criterion
+    )
+    metrics = _metrics(y_true, y_pred, y_prob)
+    metrics["loss"] = float(test_loss)
+    metrics["n_samples"] = len(y_true)
 
+    majority_class = int(config["majority_class_from_train"])
+    majority_pred = [majority_class] * len(y_true)
+    majority_prob = [float(majority_class)] * len(y_true)
+    baseline = _metrics(y_true, majority_pred, majority_prob)
+
+    index = _read_index(TEST_INDEX_PATH)
+    predictions = []
+    for sample_id, truth, pred, probability in zip(
+        ordered_ids, y_true, y_pred, y_prob
+    ):
+        predictions.append(
+            {
+                "id": sample_id,
+                "session_id": index.get(sample_id, {}).get("session_id", sample_id),
+                "true_label": truth,
+                "predicted_label": pred,
+                "cheat_probability": probability,
+            }
+        )
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    result = {
+        "train_source": "tasktracker",
+        "test_source": "pastetrace",
+        "mamba": metrics,
+        "majority_baseline": baseline,
+        "predictions": predictions,
+    }
+    result_path = RESULTS_DIR / "mamba_metrics.json"
+    with result_path.open("w", encoding="utf8") as handle:
+        json.dump(result, handle, indent=2, ensure_ascii=False, allow_nan=False)
+
+    csv_path = RESULTS_DIR / "mamba_predictions.csv"
+    with csv_path.open("w", encoding="utf8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(predictions[0]))
+        writer.writeheader()
+        writer.writerows(predictions)
+
+    print(f"External test: PasteTrace ({len(y_true)} sessions)")
+    print(f"Accuracy : {metrics['accuracy']:.4f}")
+    print(f"Macro F1 : {metrics['macro_f1']:.4f}")
+    print(f"Cheat F1 : {metrics['cheat_f1']:.4f}")
+    print(f"Normal F1: {metrics['normal_f1']:.4f}")
+    print(f"Results  : {result_path}")
+
+
+def cmd_predict(args: argparse.Namespace) -> dict:
+    from src.data.build_sequences import extract_normalized_sequence
+
+    input_path = Path(args.input)
+    if not input_path.is_file() or input_path.suffix.lower() != ".json":
+        raise SystemExit("[ERROR] predict can duong dan toi mot JSON normalized.")
+    with input_path.open(encoding="utf8", errors="ignore") as handle:
+        record = json.load(handle)
+    sequence, _ = extract_normalized_sequence(record)
+    if not sequence:
+        raise SystemExit("[ERROR] JSON khong co event type/paste/cut hop le.")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, scaler, config = _load_model_and_scaler(device)
+    scaled = scaler.transform(sequence[: int(config["max_len"])])
+    tensor = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
+    mask = torch.ones(1, tensor.shape[1], dtype=torch.bool, device=device)
     with torch.no_grad():
-        logit = model(seq_t.to(device), mask.to(device))
-        prob = torch.sigmoid(logit).item()
+        probability = float(torch.sigmoid(model(tensor, mask)).item())
+    label = int(probability >= 0.5)
+    label_name = "CHEAT" if label else "NORMAL"
+    print(
+        f"Prediction: {label_name} "
+        f"(prob={probability:.4f}, events={len(scaled)})"
+    )
+    return {"label": label, "label_name": label_name, "prob": probability}
 
-    label = 1 if prob >= 0.5 else 0
-    label_name = "CHEAT" if label == 1 else "NORMAL"
-    print(f"\nPrediction: {label_name}  (prob={prob:.3f}, events={len(seq)})")
-    return {"label": label, "label_name": label_name, "prob": prob}
 
+def main() -> None:
+    parser = argparse.ArgumentParser(description="TaskTracker -> Mamba -> PasteTrace")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(description="Mamba behavioral sequence classifier")
-    sub = parser.add_subparsers(dest="cmd")
+    train_parser = subparsers.add_parser("train", help="Train/validate on TaskTracker")
+    train_parser.add_argument("--d-model", type=int, default=D_MODEL)
+    train_parser.add_argument("--n-layers", type=int, default=N_LAYERS)
+    train_parser.add_argument("--dropout", type=float, default=DROPOUT)
+    train_parser.add_argument("--epochs", type=int, default=EPOCHS)
+    train_parser.add_argument("--lr", type=float, default=LR)
+    train_parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
+    train_parser.add_argument("--patience", type=int, default=PATIENCE)
+    train_parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    train_parser.add_argument("--max-len", type=int, default=MAX_LEN)
 
-    def _add_common(p):
-        p.add_argument("--d-model",       type=int,   default=D_MODEL)
-        p.add_argument("--n-layers",      type=int,   default=N_LAYERS)
-        p.add_argument("--dropout",       type=float, default=DROPOUT)
-        p.add_argument("--epochs",        type=int,   default=EPOCHS)
-        p.add_argument("--lr",            type=float, default=LR)
-        p.add_argument("--weight-decay",  type=float, default=WEIGHT_DECAY)
-        p.add_argument("--patience",      type=int,   default=PATIENCE)
-        p.add_argument("--batch-size",    type=int,   default=BATCH_SIZE)
-        p.add_argument("--max-len",       type=int,   default=MAX_LEN)
-
-    p_train = sub.add_parser("train", help="Train model on all dataset")
-    _add_common(p_train)
-
-    p_pred = sub.add_parser("predict", help="Predict single student from meta.json or folder")
-    p_pred.add_argument("input", help="Path to meta.json file or student folder")
+    subparsers.add_parser("test", help="Evaluate frozen model on PasteTrace")
+    predict_parser = subparsers.add_parser("predict", help="Predict one normalized JSON")
+    predict_parser.add_argument("input")
 
     args = parser.parse_args()
-
-    if args.cmd == "train":
+    if args.command == "train":
         cmd_train(args)
-    elif args.cmd == "predict":
-        cmd_predict(args)
+    elif args.command == "test":
+        cmd_test(args)
     else:
-        parser.print_help()
+        cmd_predict(args)
 
 
 if __name__ == "__main__":

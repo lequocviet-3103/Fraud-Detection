@@ -1,126 +1,122 @@
-"""Create stratified train/val/test splits from sequences_index.csv.
+"""Create TaskTracker train/validation splits for the Mamba pipeline.
 
-Output: data/splits.json  (shared by all models for fair comparison)
+PasteTrace is an external test set and is never split or mixed into training.
 """
+
+from __future__ import annotations
+
 import argparse
 import json
-import os
-import sys
+from pathlib import Path
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-INDEX_PATH = os.path.join("data", "sequences_index.csv")
-SPLITS_PATH = os.path.join("data", "splits.json")
+
+TRAIN_INDEX_PATH = Path("data") / "mamba" / "train_index.csv"
+TEST_INDEX_PATH = Path("data") / "mamba" / "test_index.csv"
+SPLITS_PATH = Path("data") / "mamba" / "splits.json"
 
 
-def make_splits(index_path: str, train_ratio: float, val_ratio: float, test_ratio: float, seed: int) -> dict:
-    total = train_ratio + val_ratio + test_ratio
-    if abs(total - 1.0) > 1e-6:
-        sys.exit(f"[ERROR] Ratios must sum to 1.0, got {total:.4f}")
+def _class_counts(labels: list[int]) -> dict[str, int]:
+    return {
+        "total": len(labels),
+        "cheat": labels.count(1),
+        "normal": labels.count(0),
+    }
 
-    df = pd.read_csv(index_path)
-    df = df[df["label"].isin([0, 1])].reset_index(drop=True)
 
-    ids = df["id"].tolist()
-    labels = df["label"].tolist()
+def make_splits(
+    train_index_path: str | Path,
+    test_index_path: str | Path,
+    val_ratio: float,
+    seed: int,
+) -> dict:
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError(f"val_ratio phai nam trong (0, 1), nhan duoc {val_ratio}")
 
-    counts = {0: labels.count(0), 1: labels.count(1)}
-    print(f"Total usable samples: {len(ids)}  (cheat={counts[1]}, normal={counts[0]})")
+    train_df = pd.read_csv(train_index_path)
+    train_df = train_df[train_df["label"].isin([0, 1])].reset_index(drop=True)
+    if train_df.empty:
+        raise ValueError("TaskTracker index khong co mau hop le.")
 
-    # Check minimum viability: each class needs >=2 samples to stratify split twice
-    for lbl, cnt in counts.items():
-        if cnt < 3:
-            print(
-                f"\n[WARNING] Only {cnt} sample(s) for label={lbl}. "
-                "Dataset is too small/imbalanced for reliable train/val/test splits.\n"
-                "Recommendation: use LOO mode instead (--loo flag in mamba_model.py).\n"
-                "Proceeding anyway — results may not be meaningful."
-            )
-
-    # Split off test first, then val from remainder
-    test_frac = test_ratio
-    val_frac_of_rest = val_ratio / (train_ratio + val_ratio)
-
-    try:
-        ids_tv, ids_test, y_tv, _ = train_test_split(
-            ids, labels, test_size=test_frac, stratify=labels, random_state=seed
-        )
-    except ValueError as e:
-        sys.exit(
-            f"[ERROR] Cannot stratify test split: {e}\n"
-            "Dataset too small or imbalanced. Use --loo flag instead."
+    ids = train_df["id"].astype(str).tolist()
+    labels = train_df["label"].astype(int).tolist()
+    counts = _class_counts(labels)
+    if min(counts["cheat"], counts["normal"]) < 2:
+        raise ValueError(
+            "Moi lop TaskTracker can it nhat 2 mau de chia train/validation."
         )
 
-    try:
-        ids_train, ids_val, _, _ = train_test_split(
-            ids_tv, y_tv, test_size=val_frac_of_rest, stratify=y_tv, random_state=seed
-        )
-    except ValueError as e:
-        sys.exit(
-            f"[ERROR] Cannot stratify val split: {e}\n"
-            "Dataset too small or imbalanced. Use --loo flag instead."
-        )
+    train_ids, val_ids, train_labels, val_labels = train_test_split(
+        ids,
+        labels,
+        test_size=val_ratio,
+        stratify=labels,
+        random_state=seed,
+    )
 
-    def split_counts(id_list):
-        lbl_map = dict(zip(ids, labels))
-        c = {0: 0, 1: 0}
-        for i in id_list:
-            c[lbl_map[i]] += 1
-        return c
+    test_df = pd.read_csv(test_index_path)
+    test_df = test_df[test_df["label"].isin([0, 1])].reset_index(drop=True)
+    test_ids = test_df["id"].astype(str).tolist()
+    test_labels = test_df["label"].astype(int).tolist()
 
-    tc, vc, xc = split_counts(ids_train), split_counts(ids_val), split_counts(ids_test)
-
-    result = {
-        "train": ids_train,
-        "val": [],
-        "test": [],
+    return {
+        "train": train_ids,
+        "val": val_ids,
+        "external_test": test_ids,
         "seed": seed,
-        "ratios": {"train": train_ratio, "val": val_ratio, "test": test_ratio},
+        "val_ratio": val_ratio,
+        "sources": {
+            "train": "tasktracker",
+            "val": "tasktracker",
+            "external_test": "pastetrace",
+        },
         "counts": {
-            "train": {"total": len(ids_train), "cheat": tc[1], "normal": tc[0]},
-            "val":   {"total": len(ids_val),   "cheat": vc[1], "normal": vc[0]},
-            "test":  {"total": len(ids_test),  "cheat": xc[1], "normal": xc[0]},
+            "train": _class_counts([int(v) for v in train_labels]),
+            "val": _class_counts([int(v) for v in val_labels]),
+            "external_test": _class_counts(test_labels),
         },
     }
 
-    # Safety: warn if any split has 0 of a class
-    for split_name, sc in [("train", tc), ("val", vc), ("test", xc)]:
-        for lbl, cnt in sc.items():
-            if cnt == 0:
-                print(
-                    f"\n[WARNING] {split_name} split has 0 samples for label={lbl}. "
-                    "Model evaluation will be unreliable. Consider using --loo mode."
-                )
 
-    return result
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Create stratified train/val/test splits")
-    parser.add_argument("--index", default=INDEX_PATH)
-    parser.add_argument("--output", default=SPLITS_PATH)
-    parser.add_argument("--train", type=float, default=0.7)
-    parser.add_argument("--val",   type=float, default=0.15)
-    parser.add_argument("--test",  type=float, default=0.15)
-    parser.add_argument("--seed",  type=int,   default=42)
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Split TaskTracker into train/val; keep PasteTrace as external test"
+    )
+    parser.add_argument("--train-index", default=str(TRAIN_INDEX_PATH))
+    parser.add_argument("--test-index", default=str(TEST_INDEX_PATH))
+    parser.add_argument("--output", default=str(SPLITS_PATH))
+    parser.add_argument("--val", type=float, default=0.15)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    if not os.path.isfile(args.index):
-        sys.exit(f"[ERROR] Index file not found: {args.index}\nRun build_sequences.py first.")
+    for path in (args.train_index, args.test_index):
+        if not Path(path).is_file():
+            raise SystemExit(
+                f"[ERROR] Khong tim thay {path}. Hay chay build_sequences truoc."
+            )
 
-    splits = make_splits(args.index, args.train, args.val, args.test, args.seed)
+    try:
+        splits = make_splits(
+            args.train_index, args.test_index, val_ratio=args.val, seed=args.seed
+        )
+    except ValueError as exc:
+        raise SystemExit(f"[ERROR] {exc}") from exc
 
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w", encoding="utf8") as f:
-        json.dump(splits, f, indent=2)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf8") as handle:
+        json.dump(splits, handle, indent=2, ensure_ascii=False)
 
-    c = splits["counts"]
-    print(f"\nSplits saved -> {args.output}")
-    print(f"  train : {c['train']['total']} (cheat={c['train']['cheat']}, normal={c['train']['normal']})")
-    print(f"  val   : {c['val']['total']}   (cheat={c['val']['cheat']}, normal={c['val']['normal']})")
-    print(f"  test  : {c['test']['total']}  (cheat={c['test']['cheat']}, normal={c['test']['normal']})")
-    print(f"  seed  : {args.seed}")
+    print(f"Splits saved -> {output}")
+    for name in ("train", "val", "external_test"):
+        count = splits["counts"][name]
+        print(
+            f"  {name:13}: {count['total']} "
+            f"(cheat={count['cheat']}, normal={count['normal']})"
+        )
+    print("  External test remains PasteTrace only.")
 
 
 if __name__ == "__main__":

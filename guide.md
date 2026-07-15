@@ -320,10 +320,18 @@ python -m src.ml.fusion_model     # load model → dự đoán
 
 Hoặc dùng UI: chọn folder mới → hệ thống nhận diện PREDICT mode → chạy bước 1→4.
 
-### Tạo data test giả
+### Mamba data flow
+
+Mamba dùng `tasktracker/normalized/` để train/validation và dùng
+`pastetrace/normalized/` làm external test. Hai bộ dữ liệu được build riêng vào
+`data/mamba/train_sequences/` và `data/mamba/test_sequences/`; scaler chỉ fit
+trên TaskTracker train split.
+
 ```bash
-python scripts/create_test_cohort.py
-# Tạo test_new_cohort/ với 3 CHEAT + 2 normal (có nhãn để kiểm tra độ chính xác)
+python -m src.data.build_sequences --train-dir tasktracker --test-dir pastetrace --min-events 1
+python -m src.data.make_splits --val 0.15 --seed 42
+python -m src.models.mamba_model train
+python -m src.models.mamba_model test
 ```
 
 ---
@@ -342,9 +350,6 @@ python scripts/create_test_cohort.py
 ---
 
 ## FAQ
-
-**Q: Tại sao test_new_cohort có agrigation.csv?**
-A: Để kiểm tra xem model dự đoán có đúng không (compare với nhãn thật). Trong triển khai thực tế, khoá học mới sẽ KHÔNG có agrigation.csv — chỉ cần code + meta.json.
 
 **Q: Để dùng inference mode, tôi làm gì?**
 A: Xóa agrigation.csv khỏi thư mục dữ liệu (hoặc dùng folder không có file đó). Pipeline tự nhận PREDICT mode và load model từ `models/fusion_xgb.pkl`.
