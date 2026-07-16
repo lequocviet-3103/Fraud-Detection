@@ -1,4 +1,4 @@
-"""Streamlit dashboard for the TaskTracker -> Mamba -> PasteTrace pipeline."""
+"""Streamlit dashboard for the TaskTracker-only Mamba pipeline."""
 
 from __future__ import annotations
 
@@ -13,19 +13,16 @@ import streamlit as st
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MAMBA_DATA_DIR = PROJECT_ROOT / "data" / "mamba"
-TRAIN_INDEX = MAMBA_DATA_DIR / "train_index.csv"
-TEST_INDEX = MAMBA_DATA_DIR / "test_index.csv"
-SPLITS_PATH = MAMBA_DATA_DIR / "splits.json"
+INDEX_PATH = PROJECT_ROOT / "data" / "mamba" / "index.csv"
+SPLIT_DIR = PROJECT_ROOT / "data" / "splits" / "tasktracker"
 MODEL_DIR = PROJECT_ROOT / "models" / "mamba"
-RESULTS_PATH = PROJECT_ROOT / "results" / "mamba_metrics.json"
-TASKTRACKER_DIR = PROJECT_ROOT / "tasktracker"
-PASTETRACE_DIR = PROJECT_ROOT / "pastetrace"
+RESULTS_DIR = PROJECT_ROOT / "results" / "mamba"
+CANONICAL_INPUT = PROJECT_ROOT / "data" / "normalized" / "tasktracker"
+LEGACY_INPUT = PROJECT_ROOT / "tasktracker"
 
-
-st.set_page_config(page_title="Mamba Fraud Detection", page_icon="🧬", layout="wide")
-st.title("🧬 Mamba Behavioral Sequence Classifier")
-st.caption("Train/validation: TaskTracker | External test: PasteTrace")
+st.set_page_config(page_title="Mamba Risk Detection", page_icon="🧬", layout="wide")
+st.title("🧬 Mamba Behavioral-Risk Classifier")
+st.caption("TaskTracker only | shared grouped train/validation/test splits | weak labels")
 
 
 def run_command(arguments: list[str]) -> tuple[str, int]:
@@ -54,11 +51,11 @@ def load_json(path: Path) -> dict:
 with st.sidebar:
     st.header("Pipeline status")
     status = {
-        "TaskTracker sequences": TRAIN_INDEX.is_file(),
-        "PasteTrace sequences": TEST_INDEX.is_file(),
-        "Train/val split": SPLITS_PATH.is_file(),
-        "Mamba model": (MODEL_DIR / "mamba.pt").is_file(),
-        "External test result": RESULTS_PATH.is_file(),
+        "TaskTracker sequences": INDEX_PATH.is_file(),
+        "Shared 70/15/15 splits": (SPLIT_DIR / "manifest.json").is_file(),
+        "Mamba checkpoint": (MODEL_DIR / "mamba.pt").is_file(),
+        "Test predictions": (RESULTS_DIR / "predictions.csv").is_file(),
+        "Test metrics": (RESULTS_DIR / "metrics.json").is_file(),
     }
     for label, available in status.items():
         st.write(f"{'✅' if available else '⬜'} {label}")
@@ -71,98 +68,61 @@ with st.sidebar:
 
 
 data_tab, train_tab, test_tab, predict_tab = st.tabs(
-    ["1. Prepare data", "2. Train", "3. Test PasteTrace", "4. Predict one"]
+    ["1. Prepare data", "2. Train + validation", "3. Held-out test", "4. Predict one"]
 )
 
-
 with data_tab:
-    st.subheader("Build normalized event sequences")
+    st.subheader("Build TaskTracker event sequences")
     st.info(
-        "Data roles are fixed: tasktracker is used for train/validation; "
-        "pastetrace is used only as the external test set."
+        "Canonical input: data/normalized/tasktracker. The legacy "
+        "tasktracker/normalized folder is also supported. PasteTrace is not used."
     )
-    col_train, col_test = st.columns(2)
-    train_dir = col_train.text_input("TaskTracker folder", str(TASKTRACKER_DIR))
-    test_dir = col_test.text_input("PasteTrace folder", str(PASTETRACE_DIR))
+    default_input = CANONICAL_INPUT if CANONICAL_INPUT.exists() else LEGACY_INPUT
+    input_dir = st.text_input("Normalized TaskTracker folder", str(default_input))
     min_events = st.number_input("Minimum events", min_value=1, value=1, step=1)
-
-    if st.button("Build both datasets", type="primary"):
-        output, return_code = run_command(
+    if st.button("Build TaskTracker sequences", type="primary"):
+        output, code = run_command(
             [
                 "-m",
                 "src.data.build_sequences",
-                "--train-dir",
-                train_dir,
-                "--test-dir",
-                test_dir,
+                "--input-dir",
+                input_dir,
                 "--min-events",
                 str(int(min_events)),
             ]
         )
         st.code(output, language="text")
-        if return_code == 0:
-            st.success("Sequences built successfully.")
-        else:
-            st.error("Sequence build failed.")
+        st.success("Sequences built.") if code == 0 else st.error("Build failed.")
 
-    if TRAIN_INDEX.is_file() and TEST_INDEX.is_file():
-        train_frame = pd.read_csv(TRAIN_INDEX)
-        test_frame = pd.read_csv(TEST_INDEX)
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("#### TaskTracker (train/validation)")
-            st.metric("Sessions", len(train_frame))
-            st.write(train_frame.groupby("label").size().rename("count"))
-        with col2:
-            st.markdown("#### PasteTrace (external test)")
-            st.metric("Sessions", len(test_frame))
-            st.write(test_frame.groupby("label").size().rename("count"))
-
-        st.divider()
-        st.subheader("Create TaskTracker train/validation split")
-        validation_ratio = st.slider("Validation ratio", 0.05, 0.40, 0.15, 0.05)
-        seed = st.number_input("Random seed", value=42, step=1)
-        if st.button("Create split"):
-            output, return_code = run_command(
-                [
-                    "-m",
-                    "src.data.make_splits",
-                    "--val",
-                    str(validation_ratio),
-                    "--seed",
-                    str(int(seed)),
-                ]
-            )
+    if INDEX_PATH.is_file():
+        frame = pd.read_csv(INDEX_PATH)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Sessions", len(frame))
+        c2.metric("Participants/groups", frame["group_id"].nunique())
+        c3.metric("Risk label=1", int((frame["label"] == 1).sum()))
+        if st.button("Create shared grouped 70/15/15 splits"):
+            output, code = run_command(["-m", "src.data.make_splits", "--seed", "42"])
             st.code(output, language="text")
-            if return_code == 0:
-                st.success("Split created. PasteTrace remains untouched.")
-            else:
-                st.error("Split failed.")
+            st.success("Shared splits created.") if code == 0 else st.error("Split failed.")
 
-    if SPLITS_PATH.is_file():
-        splits = load_json(SPLITS_PATH)
-        st.json({"sources": splits.get("sources"), "counts": splits.get("counts")})
-
+    manifest = load_json(SPLIT_DIR / "manifest.json")
+    if manifest:
+        st.json(manifest)
 
 with train_tab:
-    st.subheader("Train Mamba on TaskTracker")
-    st.warning("Mamba training is intended for an NVIDIA CUDA environment.")
-    col1, col2, col3 = st.columns(3)
-    d_model = col1.selectbox("d_model", [32, 64, 128], index=1)
-    n_layers = col2.selectbox("layers", [1, 2, 3, 4], index=1)
-    dropout = col3.slider("dropout", 0.0, 0.5, 0.2, 0.05)
-    col4, col5, col6 = st.columns(3)
-    epochs = col4.number_input("epochs", 1, 500, 80)
-    batch_size = col5.selectbox("batch size", [4, 8, 16, 32], index=1)
-    patience = col6.number_input("early-stop patience", 1, 50, 10)
-    train_all = st.checkbox(
-        "Train all TaskTracker sessions (no validation/early stopping)", value=False
-    )
-
-    if not SPLITS_PATH.is_file():
-        st.info("Prepare data and create the split first.")
-    elif st.button("Train Mamba", type="primary"):
-        train_command = [
+    st.subheader("Train on train split; select checkpoint and threshold on validation")
+    st.warning("The held-out test CSV is verified but its samples are not loaded during training.")
+    c1, c2, c3 = st.columns(3)
+    d_model = c1.selectbox("d_model", [32, 64, 128], index=1)
+    n_layers = c2.selectbox("layers", [1, 2, 3, 4], index=1)
+    dropout = c3.slider("dropout", 0.0, 0.5, 0.2, 0.05)
+    c4, c5, c6 = st.columns(3)
+    epochs = c4.number_input("epochs", 1, 500, 80)
+    batch_size = c5.selectbox("batch size", [4, 8, 16, 32], index=1)
+    patience = c6.number_input("early-stop patience", 1, 50, 10)
+    if st.button("Train Mamba", type="primary"):
+        output, code = run_command(
+            [
                 "-m",
                 "src.models.mamba_model",
                 "train",
@@ -178,58 +138,43 @@ with train_tab:
                 str(batch_size),
                 "--patience",
                 str(int(patience)),
+                "--seed",
+                "42",
             ]
-        if train_all:
-            train_command.append("--train-all")
-        output, return_code = run_command(train_command)
+        )
         st.code(output, language="text")
-        if return_code == 0:
-            st.success("Best validation checkpoint saved.")
-        else:
-            st.error("Training failed.")
-
+        st.success("Best validation checkpoint saved.") if code == 0 else st.error("Training failed.")
     config = load_json(MODEL_DIR / "config.json")
     if config:
         st.json(config)
 
-
 with test_tab:
-    st.subheader("Evaluate the frozen model on PasteTrace")
-    st.caption(
-        "This command never fits the scaler, updates weights, or changes "
-        "hyperparameters using PasteTrace."
-    )
-    if not (MODEL_DIR / "mamba.pt").is_file():
-        st.info("Train the model first.")
-    elif st.button("Run external test", type="primary"):
-        output, return_code = run_command(
-            ["-m", "src.models.mamba_model", "test"]
-        )
+    st.subheader("Evaluate the frozen model on the held-out TaskTracker test split")
+    st.caption("Weights and threshold are frozen before this command reads test sessions.")
+    if st.button("Run held-out test", type="primary"):
+        output, code = run_command(["-m", "src.models.mamba_model", "test"])
         st.code(output, language="text")
-        if return_code == 0:
-            st.success("PasteTrace evaluation completed.")
-        else:
-            st.error("Evaluation failed.")
-
-    results = load_json(RESULTS_PATH)
-    if results:
-        metrics = results.get("mamba", {})
+        st.success("Test completed.") if code == 0 else st.error("Test failed.")
+    metrics = load_json(RESULTS_DIR / "metrics.json")
+    if metrics:
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Accuracy", f"{metrics.get('accuracy', 0):.3f}")
-        c2.metric("Macro F1", f"{metrics.get('macro_f1', 0):.3f}")
-        c3.metric("Cheat F1", f"{metrics.get('cheat_f1', 0):.3f}")
-        c4.metric("Normal F1", f"{metrics.get('normal_f1', 0):.3f}")
-        st.dataframe(pd.DataFrame(results.get("predictions", [])))
-
+        c1.metric("Precision", f"{metrics.get('precision', 0):.3f}")
+        c2.metric("Recall", f"{metrics.get('recall', 0):.3f}")
+        c3.metric("F1", f"{metrics.get('f1', 0):.3f}")
+        c4.metric("Balanced accuracy", f"{metrics.get('balanced_accuracy', 0):.3f}")
+        st.json(metrics)
+    predictions_path = RESULTS_DIR / "predictions.csv"
+    if predictions_path.is_file():
+        st.dataframe(pd.read_csv(predictions_path), use_container_width=True)
 
 with predict_tab:
-    st.subheader("Predict one normalized session JSON")
-    default_json = PASTETRACE_DIR / "normalized" / "111_A.json"
+    st.subheader("Predict one unlabeled normalized TaskTracker JSON")
+    normalized_dir = default_input / "normalized" if (default_input / "normalized").is_dir() else default_input
+    examples = sorted(normalized_dir.glob("*.json"))
+    default_json = examples[0] if examples else normalized_dir / "session.json"
     input_path = st.text_input("Normalized JSON", str(default_json))
     if st.button("Predict"):
-        output, return_code = run_command(
-            ["-m", "src.models.mamba_model", "predict", input_path]
-        )
-        st.code(output, language="text")
-        if return_code != 0:
+        output, code = run_command(["-m", "src.models.mamba_model", "predict", input_path])
+        st.code(output, language="json")
+        if code != 0:
             st.error("Prediction failed.")

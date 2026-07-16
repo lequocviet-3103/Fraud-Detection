@@ -1,13 +1,8 @@
-"""Build Mamba event sequences from the normalized datasets.
+"""Build Mamba sequences from the normalized TaskTracker dataset only.
 
-The data roles are intentionally fixed by default:
-
-* ``tasktracker/`` is the training/validation dataset.
-* ``pastetrace/`` is the external test dataset.
-
-Both folders must contain ``normalized/labels.csv`` and one JSON file per
-session.  No data from the external test set is used while fitting the scaler
-or the model.
+Canonical input is ``data/normalized/tasktracker``.  The legacy
+``tasktracker/normalized`` layout is accepted so existing data need not be
+copied.  Dataset splitting happens later and is shared through CSV files.
 """
 
 from __future__ import annotations
@@ -20,19 +15,19 @@ import os
 from pathlib import Path
 
 
-TRAIN_DATA_ROOT = "tasktracker"
-TEST_DATA_ROOT = "pastetrace"
+DATA_ROOT = Path("data") / "normalized" / "tasktracker"
+LEGACY_DATA_ROOT = Path("tasktracker")
 MAMBA_DATA_DIR = Path("data") / "mamba"
-TRAIN_OUTPUT_DIR = MAMBA_DATA_DIR / "train_sequences"
-TEST_OUTPUT_DIR = MAMBA_DATA_DIR / "test_sequences"
-TRAIN_INDEX_PATH = MAMBA_DATA_DIR / "train_index.csv"
-TEST_INDEX_PATH = MAMBA_DATA_DIR / "test_index.csv"
+SEQUENCE_DIR = MAMBA_DATA_DIR / "sequences"
+INDEX_PATH = MAMBA_DATA_DIR / "index.csv"
 
 FEATURE_NAMES = [
     "is_type",
     "is_paste",
     "is_cut",
     "log_len",
+    "paste_log_len",
+    "is_large_paste",
     "log_delta_time",
 ]
 
@@ -83,7 +78,11 @@ def _load_sessions(normalized_dir: Path) -> dict[str, tuple[Path, dict]]:
 
 
 def extract_normalized_sequence(record: dict) -> tuple[list[list[float]], bool]:
-    """Convert one normalized session record into five cross-source features."""
+    """Convert one normalized session record into seven cross-source features.
+
+    The optional ``label`` field in a JSON record is deliberately ignored. Labels
+    are loaded separately from labels.csv by ``build_dataset_sequences``.
+    """
     sequence: list[list[float]] = []
     previous_time: float | None = None
     time_available = False
@@ -123,6 +122,8 @@ def extract_normalized_sequence(record: dict) -> tuple[list[list[float]], bool]:
                 float(event_type == "paste"),
                 float(event_type == "cut"),
                 math.log1p(len(text)),
+                math.log1p(len(text)) if event_type == "paste" else 0.0,
+                float(event_type == "paste" and len(text) >= 128),
                 math.log1p(delta_time),
             ]
         )
@@ -140,6 +141,9 @@ def summarize_normalized_events(record: dict) -> dict[str, int | float]:
         "own_paste_events": 0,
         "same_machine_paste_events": 0,
         "unknown_paste_events": 0,
+        "external_pasted_chars": 0,
+        "max_external_paste_chars": 0,
+        "max_paste_chars": 0,
         "typed_chars": 0,
         "pasted_chars": 0,
         "cut_chars": 0,
@@ -163,6 +167,7 @@ def summarize_normalized_events(record: dict) -> dict[str, int | float]:
         summary[char_key] += text_len
 
         if event_type == "paste":
+            summary["max_paste_chars"] = max(summary["max_paste_chars"], text_len)
             source = str(event.get("paste_source") or "").strip().lower()
             source_key = {
                 "external": "external_paste_events",
@@ -170,6 +175,11 @@ def summarize_normalized_events(record: dict) -> dict[str, int | float]:
                 "same_machine": "same_machine_paste_events",
             }.get(source, "unknown_paste_events")
             summary[source_key] += 1
+            if source == "external":
+                summary["external_pasted_chars"] += text_len
+                summary["max_external_paste_chars"] = max(
+                    summary["max_external_paste_chars"], text_len
+                )
 
         try:
             timestamp = float(event.get("t"))
@@ -183,8 +193,23 @@ def summarize_normalized_events(record: dict) -> dict[str, int | float]:
     return summary
 
 
-def _safe_id(dataset_name: str, source_path: Path) -> str:
-    return f"{dataset_name}_{source_path.stem}"
+def infer_group_id(session_id: str, record: dict) -> str:
+    """Return the anonymized participant identity used for grouped splitting.
+
+    TaskTracker session ids repeat ``language`` and ``task`` before the
+    participant-specific suffix. The suffix is stable across tasks for the
+    same participant in the supplied normalized dataset.
+    """
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    language = str(metadata.get("language") or "").strip()
+    task = str(metadata.get("task") or "").strip()
+    prefix = f"tasktracker_{language}_{task}_{task}_"
+    if language and task and session_id.startswith(prefix):
+        suffix = session_id[len(prefix) :]
+        if suffix:
+            return suffix
+    # Safe fallback: a unique group prevents accidental merging of participants.
+    return session_id
 
 
 def build_dataset_sequences(
@@ -219,13 +244,15 @@ def build_dataset_sequences(
             )
             continue
 
-        sample_id = _safe_id(dataset_name, source_path)
+        sample_id = session_id
+        group_id = infer_group_id(session_id, record)
         output_path = out_dir / f"{sample_id}.json"
         output_record = {
             "id": sample_id,
             "session_id": session_id,
             "dataset": dataset_name,
             "source": record.get("source", dataset_name),
+            "group_id": group_id,
             "label": label,
             "n_events": len(sequence),
             "time_available": time_available,
@@ -241,6 +268,7 @@ def build_dataset_sequences(
                 "id": sample_id,
                 "session_id": session_id,
                 "dataset": dataset_name,
+                "group_id": group_id,
                 "label": label,
                 "n_events": len(sequence),
                 "time_available": time_available,
@@ -262,6 +290,7 @@ def build_dataset_sequences(
                 "id",
                 "session_id",
                 "dataset",
+                "group_id",
                 "label",
                 "n_events",
                 "time_available",
@@ -271,11 +300,11 @@ def build_dataset_sequences(
         writer.writeheader()
         writer.writerows(rows)
 
-    n_cheat = sum(row["label"] == 1 for row in rows)
+    n_risk = sum(row["label"] == 1 for row in rows)
     n_normal = sum(row["label"] == 0 for row in rows)
     lengths = sorted(row["n_events"] for row in rows)
     print(f"\n[{dataset_name}] {len(rows)} sequences -> {out_dir}")
-    print(f"  Labels: cheat={n_cheat}, normal={n_normal}")
+    print(f"  Weak labels: risk=1: {n_risk}, normal=0: {n_normal}")
     if lengths:
         print(
             f"  Events: min={lengths[0]}, median={lengths[len(lengths) // 2]}, "
@@ -292,39 +321,33 @@ def build_dataset_sequences(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build TaskTracker train sequences and PasteTrace test sequences"
+        description="Build Mamba sequences from normalized TaskTracker"
     )
-    parser.add_argument("--train-dir", default=TRAIN_DATA_ROOT)
-    parser.add_argument("--test-dir", default=TEST_DATA_ROOT)
+    parser.add_argument("--input-dir", default=str(DATA_ROOT))
     parser.add_argument("--output-root", default=str(MAMBA_DATA_DIR))
     parser.add_argument("--min-events", type=int, default=1)
-    parser.add_argument(
-        "--test-subset", choices=("all", "original16"), default="all"
-    )
     args = parser.parse_args()
 
+    input_root = Path(args.input_dir)
+    canonical_ready = (input_root / "labels.csv").is_file() or (
+        input_root / "normalized" / "labels.csv"
+    ).is_file()
+    if args.input_dir == str(DATA_ROOT) and not canonical_ready and LEGACY_DATA_ROOT.exists():
+        input_root = LEGACY_DATA_ROOT
+        print(f"Canonical input not found; using legacy layout: {input_root / 'normalized'}")
+
     output_root = Path(args.output_root)
-    train_rows = build_dataset_sequences(
-        args.train_dir,
-        output_root / "train_sequences",
-        output_root / "train_index.csv",
+    rows = build_dataset_sequences(
+        input_root,
+        output_root / "sequences",
+        output_root / "index.csv",
         dataset_name="tasktracker",
         min_events=args.min_events,
     )
-    test_rows = build_dataset_sequences(
-        args.test_dir,
-        output_root / "test_sequences",
-        output_root / "test_index.csv",
-        dataset_name="pastetrace",
-        min_events=args.min_events,
-        subset=args.test_subset,
-    )
 
-    if not train_rows:
+    if not rows:
         raise SystemExit("[ERROR] TaskTracker khong co sequence hop le de train.")
-    if not test_rows:
-        raise SystemExit("[ERROR] PasteTrace khong co sequence hop le de test.")
-    print("\nDa chuan bi xong: TaskTracker=train, PasteTrace=external test.")
+    print(f"\nPrepared {len(rows)} TaskTracker sessions for shared train/validation/test splits.")
 
 
 if __name__ == "__main__":

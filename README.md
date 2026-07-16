@@ -5,38 +5,49 @@ Ket hop hai nhanh: phan tich **code text** (CodeBERT) va phan tich **hanh vi go 
 
 ---
 
-## Mamba: TaskTracker train, PasteTrace test
+## Mamba: TaskTracker-only, shared 70/15/15 split
 
-Luong Mamba moi dung hai bo du lieu normalized va co dinh vai tro de tranh data leakage:
+Nhanh Mamba chi dung 470 session TaskTracker. PasteTrace khong con la input train,
+validation hay test cua Mamba. Input chuan la `data/normalized/tasktracker/`;
+`tasktracker/normalized/` cu van duoc ho tro de tranh phai copy du lieu.
 
-- `tasktracker/normalized/`: train va validation.
-- `pastetrace/normalized/`: external test duy nhat.
-- Scaler chi duoc fit tren TaskTracker train split.
-- PasteTrace khong duoc dung de fit scaler, train model hoac chon checkpoint.
+- `data/splits/tasktracker/train.csv`: fit scaler va train weights.
+- `data/splits/tasktracker/validation.csv`: chon checkpoint va threshold.
+- `data/splits/tasktracker/test.csv`: danh gia cuoi cung mot lan.
+- Cac session co cung participant/group id luon nam trong cung mot split.
+- Nhan TaskTracker la weak behavioral-risk label, khong phai bang chung cheating.
 
 Chay CLI:
 
 ```bash
-python -m src.data.build_sequences --train-dir tasktracker --test-dir pastetrace --min-events 1
-python -m src.data.make_splits --val 0.15 --seed 42
-python -m src.models.mamba_model train --train-all --epochs 80 --batch-size 8
+python -m src.data.build_sequences --min-events 1
+python -m src.data.make_splits --train 0.70 --validation 0.15 --test 0.15 --seed 42
+python -m src.models.mamba_model train --epochs 80 --patience 10 --lr 3e-4 --batch-size 8 --seed 42
 python -m src.models.mamba_model test
 ```
 
-Model input chi gom 5 feature co o ca hai dataset: `is_type`, `is_paste`,
-`is_cut`, `log_len`, `log_delta_time`. Nguon paste duoc xuat trong bang giai
-thich nhung khong dua vao model, vi TaskTracker khong cung cap nguon paste tuong
-duong PasteTrace. `cheat_probability` la sigmoid score; mac dinh score >= 0.5
-thi du doan CHEAT.
+Model input chi gom 7 feature co o ca hai dataset: `is_type`, `is_paste`,
+`is_cut`, `log_len`, `paste_log_len`, `is_large_paste`, `log_delta_time`.
+Model dung masked mean+max pooling de khong lam mat cac cu paste lon, hiem.
+`risk_score` la sigmoid decision score trong [0,1], khong duoc mo ta la xac suat
+cheating da calibration. Threshold duoc chon bang validation de toi da positive F1,
+sau do dong bang khi test.
 
 Output:
 
 ```text
-data/mamba/train_sequences/    # TaskTracker
-data/mamba/test_sequences/     # PasteTrace
+data/mamba/sequences/                          # 470 TaskTracker sequences
+data/mamba/index.csv                           # session/label/group index
+data/splits/tasktracker/train.csv              # shared split
+data/splits/tasktracker/validation.csv
+data/splits/tasktracker/test.csv
+data/splits/tasktracker/manifest.json          # counts + leakage audit
 models/mamba/mamba.pt
-results/mamba_metrics.json
-results/mamba_predictions.csv
+models/mamba/config.json                       # threshold + architecture
+results/mamba/predictions.csv                  # common comparison schema
+results/mamba/metrics.json                     # common comparison metrics
+results/mamba/validation_predictions.csv       # Mamba threshold audit
+results/mamba/training_history.csv              # loss/F1 per epoch
 ```
 
 Dashboard rieng cho Mamba:
@@ -47,9 +58,10 @@ streamlit run src/ui/mamba_app.py
 
 Notebook GPU: `notebooks/mamba_colab.ipynb`.
 
-`--train-all` dung toan bo TaskTracker de fit scaler va train model. Che do nay
-khong co validation/early stopping; nen chot hyperparameter bang che do train/val
-truoc, sau do moi train-all lan cuoi.
+Bon cot dau cua `predictions.csv` la `session_id,true_label,risk_score,pred_label`.
+`metrics.json` co cac field so sanh chung: precision, recall, f1, auc,
+balanced_accuracy, TP/TN/FP/FN, train runtime va inference runtime. Cac field Mamba
+bo sung duoc mo ta day du trong `MAMBA_IO.md`.
 
 ---
 
@@ -349,8 +361,8 @@ FraudDetection3Model/
 ├── models/                      # Trained models (auto-generated)
 │   ├── fusion_xgb.pkl           # XGBoost saved model
 │   └── svm/
-├── tasktracker/                 # Mamba train/validation data (normalized)
-├── pastetrace/                  # Mamba external test data (normalized)
+├── tasktracker/                 # Legacy normalized TaskTracker layout
+├── data/splits/tasktracker/     # Shared Mamba train/validation/test IDs
 ├── requirements.txt
 ├── guide.md                     # Giai thich chi tiet source code
 └── README.md

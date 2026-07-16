@@ -1,13 +1,13 @@
-"""Mamba classifier for normalized behavioral event sequences.
+"""Mamba classifier using shared TaskTracker train/validation/test splits.
 
 Commands::
 
     python -m src.models.mamba_model train
     python -m src.models.mamba_model test
-    python -m src.models.mamba_model predict pastetrace/normalized/111_A.json
+    python -m src.models.mamba_model predict data/normalized/tasktracker/session.json
 
-Training and validation use TaskTracker only. ``test`` evaluates the frozen
-model on PasteTrace, which is kept as a fully external test dataset.
+All labels are weak behavioral-risk labels: 0=normal-like, 1=risky. The test
+split is never used for fitting, checkpoint selection, or threshold selection.
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
-import sys
+import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import (
     accuracy_score,
+    balanced_accuracy_score,
     confusion_matrix,
     f1_score,
     precision_recall_fscore_support,
@@ -33,13 +34,11 @@ from torch.utils.data import DataLoader
 
 
 MAMBA_DATA_DIR = Path("data") / "mamba"
-SPLITS_PATH = MAMBA_DATA_DIR / "splits.json"
-TRAIN_SEQ_DIR = MAMBA_DATA_DIR / "train_sequences"
-TEST_SEQ_DIR = MAMBA_DATA_DIR / "test_sequences"
-TRAIN_INDEX_PATH = MAMBA_DATA_DIR / "train_index.csv"
-TEST_INDEX_PATH = MAMBA_DATA_DIR / "test_index.csv"
-MODEL_DIR = os.path.join("models", "mamba")
-RESULTS_DIR = Path("results")
+SEQUENCE_DIR = MAMBA_DATA_DIR / "sequences"
+INDEX_PATH = MAMBA_DATA_DIR / "index.csv"
+SPLIT_DIR = Path("data") / "splits" / "tasktracker"
+MODEL_DIR = Path("models") / "mamba"
+RESULTS_DIR = Path("results") / "mamba"
 
 D_MODEL = 64
 N_LAYERS = 2
@@ -52,6 +51,14 @@ BATCH_SIZE = 8
 MAX_LEN = 1000
 
 
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def _import_mamba():
     try:
         from mamba_ssm import Mamba
@@ -59,8 +66,8 @@ def _import_mamba():
         return Mamba
     except (ImportError, OSError) as exc:
         raise RuntimeError(
-            "Khong import duoc mamba-ssm. Hay dung moi truong GPU NVIDIA/CUDA "
-            "va cai requirements-mamba.txt."
+            "Khong import duoc mamba-ssm. Hay dung GPU NVIDIA/CUDA va cai "
+            "requirements-mamba.txt."
         ) from exc
 
 
@@ -69,9 +76,7 @@ class MambaBlock(nn.Module):
         super().__init__()
         mamba_class = _import_mamba()
         self.norm = nn.LayerNorm(d_model)
-        self.mamba = mamba_class(
-            d_model=d_model, d_state=16, d_conv=4, expand=2
-        )
+        self.mamba = mamba_class(d_model=d_model, d_state=16, d_conv=4, expand=2)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return inputs + self.mamba(self.norm(inputs))
@@ -87,18 +92,17 @@ class MambaClassifier(nn.Module):
     ):
         super().__init__()
         self.input_proj = nn.Linear(n_features, d_model)
-        self.blocks = nn.Sequential(
-            *[MambaBlock(d_model) for _ in range(n_layers)]
-        )
+        self.blocks = nn.Sequential(*[MambaBlock(d_model) for _ in range(n_layers)])
         self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(d_model, 1)
+        self.head = nn.Linear(d_model * 2, 1)
 
     def forward(self, inputs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         hidden = self.blocks(self.input_proj(inputs))
         mask_float = mask.unsqueeze(-1).float()
-        pooled = (hidden * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(
-            min=1
-        )
+        mean_pooled = (hidden * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1)
+        masked_hidden = hidden.masked_fill(~mask.unsqueeze(-1), float("-inf"))
+        max_pooled = masked_hidden.max(dim=1).values
+        pooled = torch.cat([mean_pooled, max_pooled], dim=-1)
         return self.head(self.dropout(pooled)).squeeze(-1)
 
 
@@ -108,12 +112,11 @@ def _run_epoch(
     device: torch.device,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
-) -> tuple[float, list[int], list[int], list[float], list[str]]:
+) -> tuple[float, list[int], list[float], list[str]]:
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
     y_true: list[int] = []
-    y_pred: list[int] = []
     y_prob: list[float] = []
     sample_ids: list[str] = []
 
@@ -137,463 +140,433 @@ def _run_epoch(
                     raise FloatingPointError("Gradient norm became NaN/Inf")
                 optimizer.step()
 
-            total_loss += loss.item() * len(labels)
+            total_loss += float(loss.item()) * len(labels)
             probabilities = torch.sigmoid(logits).detach().cpu().numpy()
-            predictions = (probabilities >= 0.5).astype(int)
             y_true.extend(labels.detach().cpu().numpy().astype(int).tolist())
-            y_pred.extend(predictions.tolist())
             y_prob.extend(probabilities.astype(float).tolist())
             sample_ids.extend(ids)
 
-    average_loss = total_loss / max(len(loader.dataset), 1)
-    return average_loss, y_true, y_pred, y_prob, sample_ids
+    return total_loss / max(len(loader.dataset), 1), y_true, y_prob, sample_ids
 
 
-def _metrics(
-    y_true: list[int], y_pred: list[int], y_prob: list[float]
-) -> dict[str, float | int | list[list[int]] | None]:
-    if not np.all(np.isfinite(np.asarray(y_prob, dtype=float))):
-        raise ValueError(
-            "Prediction scores contain NaN/Inf. The saved checkpoint is invalid; "
-            "retrain the model."
-        )
+def _metrics(y_true: list[int], y_prob: list[float], threshold: float) -> dict:
+    scores = np.asarray(y_prob, dtype=float)
+    if not np.all(np.isfinite(scores)):
+        raise ValueError("Prediction scores contain NaN/Inf; retrain the model.")
+    y_pred = (scores >= threshold).astype(int)
     precision, recall, f1, support = precision_recall_fscore_support(
         y_true, y_pred, labels=[0, 1], zero_division=0
     )
-    result: dict[str, float | int | list[list[int]] | None] = {
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    return {
+        "precision": float(precision[1]),
+        "recall": float(recall[1]),
+        "f1": float(f1[1]),
+        "auc": float(roc_auc_score(y_true, scores)) if len(set(y_true)) == 2 else None,
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "tp": int(tp),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
         "normal_precision": float(precision[0]),
         "normal_recall": float(recall[0]),
         "normal_f1": float(f1[0]),
         "normal_support": int(support[0]),
-        "cheat_precision": float(precision[1]),
-        "cheat_recall": float(recall[1]),
-        "cheat_f1": float(f1[1]),
-        "cheat_support": int(support[1]),
-        "confusion_matrix": confusion_matrix(
-            y_true, y_pred, labels=[0, 1]
-        ).astype(int).tolist(),
+        "risk_precision": float(precision[1]),
+        "risk_recall": float(recall[1]),
+        "risk_f1": float(f1[1]),
+        "risk_support": int(support[1]),
     }
-    result["roc_auc"] = (
-        float(roc_auc_score(y_true, y_prob))
-        if len(set(y_true)) == 2
-        else None
+
+
+def _select_threshold(y_true: list[int], y_prob: list[float]) -> tuple[float, dict]:
+    """Choose the validation threshold that maximizes positive-class F1."""
+    candidates = np.unique(np.concatenate([np.asarray(y_prob, dtype=float), [0.5]]))
+    best_threshold = 0.5
+    best_metrics = _metrics(y_true, y_prob, best_threshold)
+    best_key = (
+        best_metrics["f1"],
+        best_metrics["balanced_accuracy"],
+        -abs(best_threshold - 0.5),
     )
-    return result
+    for threshold in candidates:
+        metrics = _metrics(y_true, y_prob, float(threshold))
+        key = (metrics["f1"], metrics["balanced_accuracy"], -abs(float(threshold) - 0.5))
+        if key > best_key:
+            best_threshold = float(threshold)
+            best_metrics = metrics
+            best_key = key
+    return best_threshold, best_metrics
 
 
-def _read_index(index_path: Path) -> dict[str, dict[str, str]]:
-    with index_path.open(encoding="utf8", newline="") as handle:
-        return {row["id"]: row for row in csv.DictReader(handle)}
+def _read_index() -> dict[str, dict[str, str]]:
+    with INDEX_PATH.open(encoding="utf8", newline="") as handle:
+        return {row["session_id"]: row for row in csv.DictReader(handle)}
 
 
-def _read_sequence_record(sequence_dir: Path, sample_id: str) -> dict:
-    with (sequence_dir / f"{sample_id}.json").open(encoding="utf8") as handle:
-        return json.load(handle)
+def _read_split(path: Path) -> list[str]:
+    with path.open(encoding="utf8", newline="") as handle:
+        return [row["session_id"] for row in csv.DictReader(handle) if row.get("session_id")]
 
 
-def _required_training_inputs() -> dict:
-    for path in (SPLITS_PATH, TRAIN_INDEX_PATH, TEST_INDEX_PATH):
+def _required_inputs() -> tuple[dict[str, list[str]], dict[str, dict[str, str]], dict]:
+    paths = {
+        "index": INDEX_PATH,
+        "train": SPLIT_DIR / "train.csv",
+        "validation": SPLIT_DIR / "validation.csv",
+        "test": SPLIT_DIR / "test.csv",
+        "manifest": SPLIT_DIR / "manifest.json",
+    }
+    for path in paths.values():
         if not path.is_file():
-            raise SystemExit(
-                f"[ERROR] Thieu {path}. Chay build_sequences va make_splits truoc."
-            )
-    with SPLITS_PATH.open(encoding="utf8") as handle:
-        splits = json.load(handle)
-    if splits.get("sources", {}).get("external_test") != "pastetrace":
-        raise SystemExit("[ERROR] splits.json khong khai bao PasteTrace la external test.")
-    return splits
+            raise SystemExit(f"[ERROR] Missing {path}; run build_sequences and make_splits.")
+    index = _read_index()
+    splits = {name: _read_split(paths[name]) for name in ("train", "validation", "test")}
+    with paths["manifest"].open(encoding="utf8") as handle:
+        manifest = json.load(handle)
+
+    split_sets = {name: set(values) for name, values in splits.items()}
+    if any(len(values) != len(split_sets[name]) for name, values in splits.items()):
+        raise SystemExit("[ERROR] Duplicate session_id found inside split CSV.")
+    overlap = (
+        (split_sets["train"] & split_sets["validation"])
+        | (split_sets["train"] & split_sets["test"])
+        | (split_sets["validation"] & split_sets["test"])
+    )
+    if overlap:
+        raise SystemExit("[ERROR] Session leakage found across split CSV files.")
+    union = set().union(*split_sets.values())
+    if union != set(index):
+        raise SystemExit("[ERROR] Split CSV union does not exactly match TaskTracker index.")
+    group_sets = {
+        name: {index[session]["group_id"] for session in sessions}
+        for name, sessions in splits.items()
+    }
+    group_overlap = (
+        (group_sets["train"] & group_sets["validation"])
+        | (group_sets["train"] & group_sets["test"])
+        | (group_sets["validation"] & group_sets["test"])
+    )
+    if group_overlap:
+        raise SystemExit("[ERROR] Participant/group leakage found across splits.")
+    return splits, index, manifest
+
+
+def _make_loader(dataset, batch_size: int, shuffle: bool):
+    from src.models.mamba_dataset import collate_fn
+
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
+
+
+def _write_prediction_csv(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _prediction_rows(
+    ordered_ids: list[str],
+    y_true: list[int],
+    y_prob: list[float],
+    threshold: float,
+    max_len: int,
+) -> list[dict]:
+    rows: list[dict] = []
+    for session_id, truth, score in zip(ordered_ids, y_true, y_prob):
+        with (SEQUENCE_DIR / f"{session_id}.json").open(encoding="utf8") as handle:
+            record = json.load(handle)
+        pred = int(score >= threshold)
+        summary = record.get("behavior_summary", {})
+        n_events = int(record.get("n_events", 0))
+        rows.append(
+            {
+                # Required common comparison schema (keep these four first).
+                "session_id": session_id,
+                "true_label": truth,
+                "risk_score": score,
+                "pred_label": pred,
+                # Mamba-specific audit fields.
+                "threshold": threshold,
+                "correct": int(truth == pred),
+                "n_events": n_events,
+                "n_events_used": min(n_events, max_len),
+                "sequence_truncated": int(n_events > max_len),
+                "evidence_status": (
+                    "INSUFFICIENT_EVENTS" if n_events < 3 else "OK"
+                ),
+                "type_events": summary.get("type_events", 0),
+                "paste_events": summary.get("paste_events", 0),
+                "cut_events": summary.get("cut_events", 0),
+                "typed_chars": summary.get("typed_chars", 0),
+                "pasted_chars": summary.get("pasted_chars", 0),
+                "cut_chars": summary.get("cut_chars", 0),
+                "max_paste_chars": summary.get("max_paste_chars", 0),
+                "duration_sec": summary.get("duration_sec", 0.0),
+            }
+        )
+    return rows
 
 
 def cmd_train(args: argparse.Namespace) -> None:
-    from src.models.mamba_dataset import (
-        SequenceDataset,
-        build_scaler_from_ids,
-        collate_fn,
-    )
+    from src.data.build_sequences import FEATURE_NAMES
+    from src.models.mamba_dataset import SequenceDataset, build_scaler_from_ids
 
-    splits = _required_training_inputs()
-    train_all = bool(getattr(args, "train_all", False))
-    if train_all:
-        train_ids = list(_read_index(TRAIN_INDEX_PATH))
-        val_ids: list[str] = []
-    else:
-        train_ids = list(splits.get("train", []))
-        val_ids = list(splits.get("val", []))
-    if not train_ids or (not train_all and not val_ids):
-        raise SystemExit("[ERROR] Train/validation data dang rong.")
-
+    _set_seed(args.seed)
+    splits, _index, manifest = _required_inputs()
+    train_ids = splits["train"]
+    validation_ids = splits["validation"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    if device.type == "cpu":
-        print("[WARNING] Mamba tren CPU rat cham; nen chay bang GPU CUDA.")
+    print(
+        f"TaskTracker: train={len(train_ids)}, validation={len(validation_ids)}, "
+        f"held-out test={len(splits['test'])}"
+    )
+    print("Held-out test event sequences are not used for training or threshold selection.")
 
-    scaler = build_scaler_from_ids(train_ids, str(TRAIN_SEQ_DIR))
-    Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
-    scaler.save(os.path.join(MODEL_DIR, "scaler.json"))
+    started = time.perf_counter()
+    scaler = build_scaler_from_ids(train_ids, str(SEQUENCE_DIR), max_len=args.max_len)
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    scaler.save(str(MODEL_DIR / "scaler.json"))
+    train_dataset = SequenceDataset(train_ids, str(SEQUENCE_DIR), scaler, args.max_len)
+    validation_dataset = SequenceDataset(
+        validation_ids, str(SEQUENCE_DIR), scaler, args.max_len
+    )
+    train_loader = _make_loader(train_dataset, args.batch_size, True)
+    validation_loader = _make_loader(validation_dataset, args.batch_size, False)
 
-    train_dataset = SequenceDataset(
-        train_ids, str(TRAIN_SEQ_DIR), scaler=scaler, max_len=args.max_len
-    )
-    val_dataset = (
-        None
-        if train_all
-        else SequenceDataset(
-            val_ids, str(TRAIN_SEQ_DIR), scaler=scaler, max_len=args.max_len
-        )
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-    )
-    val_loader = (
-        None
-        if val_dataset is None
-        else DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=collate_fn,
-        )
-    )
-
-    train_labels = np.array(
-        [int(item["label"].item()) for item in train_dataset], dtype=int
-    )
-    positives = int(train_labels.sum())
-    negatives = int(len(train_labels) - positives)
-    pos_weight = torch.tensor(
-        [negatives / max(positives, 1)], dtype=torch.float32, device=device
-    )
-
+    labels = np.array([int(item["label"].item()) for item in train_dataset])
+    positives = int(labels.sum())
+    negatives = int(len(labels) - positives)
+    pos_weight = torch.tensor([negatives / max(positives, 1)], device=device)
     n_features = int(train_dataset[0]["seq"].shape[1])
     try:
-        model = MambaClassifier(
-            n_features, args.d_model, args.n_layers, args.dropout
-        ).to(device)
+        model = MambaClassifier(n_features, args.d_model, args.n_layers, args.dropout).to(device)
     except RuntimeError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    scheduler = (
-        torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(args.epochs, 1), eta_min=args.lr * 0.05
-        )
-        if train_all
-        else None
-    )
 
-    if train_all:
-        print(
-            f"TaskTracker train-all={len(train_dataset)} "
-            f"(cheat={positives}, normal={negatives})"
-        )
-        print("Validation disabled; model se chay du so epoch da chon.")
-    else:
-        print(
-            f"TaskTracker train={len(train_dataset)}, val={len(val_dataset)} "
-            f"(train cheat={positives}, normal={negatives})"
-        )
-    print("PasteTrace khong duoc dung trong buoc train nay.")
-    if train_all:
-        print(f"{'Epoch':>5} {'TrainLoss':>10}")
-    else:
-        print(f"{'Epoch':>5} {'TrainLoss':>10} {'ValLoss':>10} {'ValMacroF1':>11}")
-
-    model_path = os.path.join(MODEL_DIR, "mamba.pt")
+    model_path = MODEL_DIR / "mamba.pt"
     best_f1 = -1.0
     best_loss = float("inf")
-    best_train_loss = float("inf")
     best_epoch = 0
+    best_threshold = 0.5
     stale_epochs = 0
     stopped_reason = "completed"
-    history_rows: list[dict] = []
+    history: list[dict] = []
+    print(f"{'Epoch':>5} {'TrainLoss':>10} {'ValLoss':>10} {'ValF1':>8} {'Threshold':>10}")
 
     for epoch in range(1, args.epochs + 1):
-        current_lr = float(optimizer.param_groups[0]["lr"])
         try:
-            train_loss, *_ = _run_epoch(
-                model, train_loader, device, criterion, optimizer
+            train_loss, *_ = _run_epoch(model, train_loader, device, criterion, optimizer)
+            val_loss, val_true, val_prob, _ = _run_epoch(
+                model, validation_loader, device, criterion
             )
         except FloatingPointError as exc:
             stopped_reason = f"non_finite: {exc}"
-            print(f"[STOP] {stopped_reason}. Restoring best finite checkpoint.")
+            print(f"[STOP] {stopped_reason}")
             break
-
-        if train_all:
-            print(f"{epoch:5d} {train_loss:10.4f}")
-            history_rows.append(
-                {
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "val_loss": None,
-                    "val_macro_f1": None,
-                    "learning_rate": current_lr,
-                }
-            )
-            if train_loss < best_train_loss:
-                torch.save(model.state_dict(), model_path)
-                best_train_loss = train_loss
-                best_epoch = epoch
-            elif train_loss > max(100.0, best_train_loss * 1000.0):
-                stopped_reason = "loss_explosion"
-                print(
-                    "[STOP] Training loss exploded. "
-                    "Restoring the lowest finite-loss checkpoint."
-                )
-                break
-            assert scheduler is not None
-            scheduler.step()
-            continue
-
-        assert val_loader is not None
-        val_loss, val_true, val_pred, val_prob, _ = _run_epoch(
-            model, val_loader, device, criterion
-        )
-        val_f1 = float(_metrics(val_true, val_pred, val_prob)["macro_f1"])
-        print(f"{epoch:5d} {train_loss:10.4f} {val_loss:10.4f} {val_f1:11.4f}")
-        history_rows.append(
+        threshold, val_metrics = _select_threshold(val_true, val_prob)
+        val_f1 = float(val_metrics["f1"])
+        print(f"{epoch:5d} {train_loss:10.4f} {val_loss:10.4f} {val_f1:8.4f} {threshold:10.4f}")
+        history.append(
             {
                 "epoch": epoch,
                 "train_loss": train_loss,
-                "val_loss": val_loss,
-                "val_macro_f1": val_f1,
-                "learning_rate": current_lr,
+                "validation_loss": val_loss,
+                "validation_f1": val_f1,
+                "validation_balanced_accuracy": val_metrics["balanced_accuracy"],
+                "validation_threshold": threshold,
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
             }
         )
-
-        improved = val_f1 > best_f1 + 1e-6 or (
-            abs(val_f1 - best_f1) <= 1e-6 and val_loss < best_loss
+        improved = val_f1 > best_f1 + 1e-8 or (
+            abs(val_f1 - best_f1) <= 1e-8 and val_loss < best_loss
         )
         if improved:
             torch.save(model.state_dict(), model_path)
             best_f1 = val_f1
             best_loss = val_loss
             best_epoch = epoch
+            best_threshold = threshold
             stale_epochs = 0
         else:
             stale_epochs += 1
             if stale_epochs >= args.patience:
                 stopped_reason = "early_stopping"
-                print(f"Early stopping tai epoch {epoch}.")
+                print(f"Early stopping at epoch {epoch}.")
                 break
 
-    if train_all:
-        best_f1 = None
-        best_loss = None
-        if best_epoch == 0:
-            raise SystemExit("[ERROR] Training failed before a finite checkpoint was saved.")
-    elif best_epoch == 0:
-        raise SystemExit("[ERROR] Training failed before a validation checkpoint was saved.")
+    if best_epoch == 0:
+        raise SystemExit("[ERROR] No finite validation checkpoint was saved.")
+    train_runtime = time.perf_counter() - started
 
-    history_path = Path(MODEL_DIR) / "training_history.csv"
-    with history_path.open("w", encoding="utf8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "epoch",
-                "train_loss",
-                "val_loss",
-                "val_macro_f1",
-                "learning_rate",
-            ],
-        )
-        writer.writeheader()
-        writer.writerows(history_rows)
-
-    majority_class = int(positives >= negatives)
+    history_path = RESULTS_DIR / "training_history.csv"
+    _write_prediction_csv(history_path, history)
     config = {
+        "dataset": "tasktracker",
+        "label_type": "weak_behavioral_risk",
+        "training_seed": args.seed,
         "n_features": n_features,
-        "feature_names": train_dataset.records[0].get("feature_names", None),
+        "feature_names": FEATURE_NAMES,
         "d_model": args.d_model,
         "n_layers": args.n_layers,
         "dropout": args.dropout,
         "max_len": args.max_len,
         "best_epoch": best_epoch,
-        "best_val_macro_f1": best_f1,
-        "best_val_loss": best_loss,
-        "best_train_loss": best_train_loss if train_all else None,
-        "decision_threshold": 0.5,
+        "best_validation_f1": best_f1,
+        "best_validation_loss": best_loss,
+        "decision_threshold": best_threshold,
+        "threshold_selection": "maximize_positive_f1_on_validation",
         "epochs_requested": args.epochs,
-        "epochs_completed": len(history_rows),
+        "epochs_completed": len(history),
         "stopped_reason": stopped_reason,
-        "scheduler": "cosine" if train_all else "none",
-        "training_mode": "all_tasktracker" if train_all else "train_val",
-        "n_train_samples": len(train_dataset),
-        "n_val_samples": 0 if val_dataset is None else len(val_dataset),
-        "train_source": "tasktracker",
-        "test_source": "pastetrace",
-        "majority_class_from_train": majority_class,
+        "pooling": "masked_mean_plus_max",
+        "n_train_sessions": len(train_ids),
+        "n_validation_sessions": len(validation_ids),
+        "n_test_sessions_held_out": len(splits["test"]),
+        "train_runtime_sec": train_runtime,
+        "split_manifest": manifest,
     }
-    # SequenceDataset intentionally stores only model inputs, so keep names explicit.
-    from src.data.build_sequences import FEATURE_NAMES
+    with (MODEL_DIR / "config.json").open("w", encoding="utf8") as handle:
+        json.dump(config, handle, indent=2, ensure_ascii=False, allow_nan=False)
 
-    config["feature_names"] = FEATURE_NAMES
-    with open(os.path.join(MODEL_DIR, "config.json"), "w", encoding="utf8") as handle:
-        json.dump(config, handle, indent=2, ensure_ascii=False)
-    if train_all:
-        print(
-            f"Best finite model saved -> {model_path} "
-            f"(epoch={best_epoch}, train_loss={best_train_loss:.6f})"
-        )
-    else:
-        print(f"Best model saved -> {model_path} (epoch={best_epoch})")
-    print(f"Training history -> {history_path}")
+    # Save validation predictions from the selected checkpoint for threshold audit.
+    state = torch.load(model_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+    _, val_true, val_prob, val_ids = _run_epoch(model, validation_loader, device, criterion)
+    validation_rows = _prediction_rows(
+        val_ids, val_true, val_prob, best_threshold, args.max_len
+    )
+    _write_prediction_csv(RESULTS_DIR / "validation_predictions.csv", validation_rows)
+    print(f"Best checkpoint: epoch={best_epoch}, validation_f1={best_f1:.4f}")
+    print(f"Validation-selected threshold: {best_threshold:.6f}")
+    print(f"Train runtime: {train_runtime:.2f} sec")
 
 
 def _load_model_and_scaler(device: torch.device):
     from src.models.mamba_dataset import SequenceScaler
 
     paths = {
-        "model": Path(MODEL_DIR) / "mamba.pt",
-        "config": Path(MODEL_DIR) / "config.json",
-        "scaler": Path(MODEL_DIR) / "scaler.json",
+        "model": MODEL_DIR / "mamba.pt",
+        "config": MODEL_DIR / "config.json",
+        "scaler": MODEL_DIR / "scaler.json",
     }
     for path in paths.values():
         if not path.is_file():
-            raise SystemExit(f"[ERROR] Thieu {path}. Hay train model truoc.")
+            raise SystemExit(f"[ERROR] Missing {path}; train Mamba first.")
     with paths["config"].open(encoding="utf8") as handle:
         config = json.load(handle)
-    if config.get("train_source") != "tasktracker" or config.get(
-        "test_source"
-    ) != "pastetrace":
-        raise SystemExit("[ERROR] Model hien tai khong thuoc pipeline TaskTracker -> PasteTrace.")
+    if config.get("dataset") != "tasktracker":
+        raise SystemExit("[ERROR] Saved model is not a TaskTracker-only model.")
     scaler = SequenceScaler.load(str(paths["scaler"]))
     try:
         model = MambaClassifier(
-            config["n_features"],
-            config["d_model"],
-            config["n_layers"],
-            config["dropout"],
+            config["n_features"], config["d_model"], config["n_layers"], config["dropout"]
         )
     except RuntimeError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc
     state = torch.load(paths["model"], map_location=device)
-    invalid_tensors = [
+    invalid = [
         name
         for name, tensor in state.items()
         if torch.is_tensor(tensor) and not torch.isfinite(tensor).all()
     ]
-    if invalid_tensors:
-        preview = ", ".join(invalid_tensors[:5])
-        raise SystemExit(
-            "[ERROR] Saved model contains NaN/Inf parameters "
-            f"({preview}). Retrain before testing."
-        )
+    if invalid:
+        raise SystemExit(f"[ERROR] Saved model contains NaN/Inf: {', '.join(invalid[:5])}")
     model.load_state_dict(state)
     model.to(device).eval()
     return model, scaler, config
 
 
-def cmd_test(_args: argparse.Namespace) -> None:
-    from src.models.mamba_dataset import SequenceDataset, collate_fn
+def cmd_test(args: argparse.Namespace) -> None:
+    from src.models.mamba_dataset import SequenceDataset
 
-    splits = _required_training_inputs()
-    test_ids = list(splits.get("external_test", []))
-    if not test_ids:
-        raise SystemExit("[ERROR] PasteTrace external test split dang rong.")
-
+    splits, _index, manifest = _required_inputs()
+    test_ids = splits["test"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, scaler, config = _load_model_and_scaler(device)
-    test_dataset = SequenceDataset(
-        test_ids,
-        str(TEST_SEQ_DIR),
-        scaler=scaler,
-        max_len=int(config["max_len"]),
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        collate_fn=collate_fn,
-    )
+    test_dataset = SequenceDataset(test_ids, str(SEQUENCE_DIR), scaler, int(config["max_len"]))
+    test_loader = _make_loader(test_dataset, args.batch_size, False)
     criterion = nn.BCEWithLogitsLoss()
-    test_loss, y_true, _default_pred, y_prob, ordered_ids = _run_epoch(
-        model, test_loader, device, criterion
-    )
-    threshold = float(config.get("decision_threshold", 0.5))
-    y_pred = (np.asarray(y_prob) >= threshold).astype(int).tolist()
-    metrics = _metrics(y_true, y_pred, y_prob)
-    metrics["loss"] = float(test_loss)
-    metrics["n_samples"] = len(y_true)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    started = time.perf_counter()
+    test_loss, y_true, y_prob, ordered_ids = _run_epoch(model, test_loader, device, criterion)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    inference_runtime = time.perf_counter() - started
 
-    majority_class = int(config["majority_class_from_train"])
-    majority_pred = [majority_class] * len(y_true)
-    majority_prob = [float(majority_class)] * len(y_true)
-    baseline = _metrics(y_true, majority_pred, majority_prob)
-
-    index = _read_index(TEST_INDEX_PATH)
-    predictions = []
-    for sample_id, truth, pred, probability in zip(
-        ordered_ids, y_true, y_pred, y_prob
-    ):
-        sequence_record = _read_sequence_record(TEST_SEQ_DIR, sample_id)
-        summary = sequence_record.get("behavior_summary", {})
-        predictions.append(
-            {
-                "id": sample_id,
-                "session_id": index.get(sample_id, {}).get("session_id", sample_id),
-                "true_label": truth,
-                "true_label_name": "CHEAT" if truth else "NORMAL",
-                "predicted_label": pred,
-                "predicted_label_name": "CHEAT" if pred else "NORMAL",
-                "cheat_score": probability,
-                "cheat_probability": probability,
-                "decision_threshold": threshold,
-                "correct": int(truth == pred),
-                "n_events": sequence_record.get("n_events", 0),
-                **summary,
-            }
-        )
-
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    result = {
-        "train_source": "tasktracker",
-        "test_source": "pastetrace",
-        "input_features": config.get("feature_names", []),
-        "score_definition": (
-            "cheat_score = sigmoid(model_logit); it is a decision score in [0,1], "
-            "not a calibrated real-world probability"
-        ),
-        "decision_rule": f"CHEAT when sigmoid(logit) >= {threshold}",
-        "label_usage": (
-            "labels.csv is used only for loss during training and metrics during "
-            "testing; labels are never included in the model input sequence"
-        ),
-        "mamba": metrics,
-        "majority_baseline": baseline,
-        "predictions": predictions,
+    threshold = float(config["decision_threshold"])
+    common_metrics = _metrics(y_true, y_prob, threshold)
+    metrics = {
+        # Required shared comparison fields.
+        "n_test_sessions": len(y_true),
+        "threshold": threshold,
+        "precision": common_metrics["precision"],
+        "recall": common_metrics["recall"],
+        "f1": common_metrics["f1"],
+        "auc": common_metrics["auc"],
+        "balanced_accuracy": common_metrics["balanced_accuracy"],
+        "tp": common_metrics["tp"],
+        "tn": common_metrics["tn"],
+        "fp": common_metrics["fp"],
+        "fn": common_metrics["fn"],
+        "train_runtime_sec": float(config["train_runtime_sec"]),
+        "inference_runtime_sec": inference_runtime,
+        # Mamba-specific reproducibility and diagnostic fields.
+        "model": "mamba",
+        "dataset": "tasktracker",
+        "split": "test",
+        "label_type": "weak_behavioral_risk",
+        "threshold_selection": config["threshold_selection"],
+        "accuracy": common_metrics["accuracy"],
+        "macro_f1": common_metrics["macro_f1"],
+        "normal_precision": common_metrics["normal_precision"],
+        "normal_recall": common_metrics["normal_recall"],
+        "normal_f1": common_metrics["normal_f1"],
+        "normal_support": common_metrics["normal_support"],
+        "risk_support": common_metrics["risk_support"],
+        "test_loss": test_loss,
+        "best_epoch": config["best_epoch"],
+        "best_validation_f1": config["best_validation_f1"],
+        "input_features": config["feature_names"],
+        "max_len": config["max_len"],
+        "d_model": config["d_model"],
+        "n_layers": config["n_layers"],
+        "pooling": config["pooling"],
+        "score_definition": "risk_score = sigmoid(model_logit), in [0,1], not calibrated probability",
+        "label_note": "Weak behavioral-risk label; not confirmed evidence of cheating.",
+        "split_manifest": manifest,
     }
-    result_path = RESULTS_DIR / "mamba_metrics.json"
-    with result_path.open("w", encoding="utf8") as handle:
-        json.dump(result, handle, indent=2, ensure_ascii=False, allow_nan=False)
+    rows = _prediction_rows(
+        ordered_ids, y_true, y_prob, threshold, int(config["max_len"])
+    )
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    predictions_path = RESULTS_DIR / "predictions.csv"
+    metrics_path = RESULTS_DIR / "metrics.json"
+    _write_prediction_csv(predictions_path, rows)
+    with metrics_path.open("w", encoding="utf8") as handle:
+        json.dump(metrics, handle, indent=2, ensure_ascii=False, allow_nan=False)
 
-    csv_path = RESULTS_DIR / "mamba_predictions.csv"
-    with csv_path.open("w", encoding="utf8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(predictions[0]))
-        writer.writeheader()
-        writer.writerows(predictions)
-
-    print(f"External test: PasteTrace ({len(y_true)} sessions)")
-    print(f"Accuracy : {metrics['accuracy']:.4f}")
-    print(f"Macro F1 : {metrics['macro_f1']:.4f}")
-    print(f"Cheat F1 : {metrics['cheat_f1']:.4f}")
-    print(f"Normal F1: {metrics['normal_f1']:.4f}")
-    print(f"Results  : {result_path}")
-    print("\nPer-session predictions:")
-    for row in predictions:
-        print(
-            f"  {row['session_id']:<30} "
-            f"true={row['true_label_name']:<6} "
-            f"pred={row['predicted_label_name']:<6} "
-            f"score={row['cheat_probability']:.4f} "
-            f"threshold={threshold:.2f}"
-        )
+    print(f"TaskTracker held-out test: {len(y_true)} sessions")
+    print(f"Threshold         : {threshold:.6f} (selected on validation)")
+    print(f"Precision         : {metrics['precision']:.4f}")
+    print(f"Recall            : {metrics['recall']:.4f}")
+    print(f"F1                : {metrics['f1']:.4f}")
+    print(f"AUC               : {metrics['auc']:.4f}")
+    print(f"Balanced accuracy : {metrics['balanced_accuracy']:.4f}")
+    print(f"Confusion          : TP={metrics['tp']} TN={metrics['tn']} FP={metrics['fp']} FN={metrics['fn']}")
+    print(f"Predictions        : {predictions_path}")
+    print(f"Metrics            : {metrics_path}")
 
 
 def cmd_predict(args: argparse.Namespace) -> dict:
@@ -601,12 +574,12 @@ def cmd_predict(args: argparse.Namespace) -> dict:
 
     input_path = Path(args.input)
     if not input_path.is_file() or input_path.suffix.lower() != ".json":
-        raise SystemExit("[ERROR] predict can duong dan toi mot JSON normalized.")
+        raise SystemExit("[ERROR] predict requires one normalized JSON file.")
     with input_path.open(encoding="utf8", errors="ignore") as handle:
         record = json.load(handle)
     sequence, _ = extract_normalized_sequence(record)
     if not sequence:
-        raise SystemExit("[ERROR] JSON khong co event type/paste/cut hop le.")
+        raise SystemExit("[ERROR] JSON has no valid type/paste/cut events.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, scaler, config = _load_model_and_scaler(device)
@@ -614,22 +587,24 @@ def cmd_predict(args: argparse.Namespace) -> dict:
     tensor = torch.tensor(scaled, dtype=torch.float32).unsqueeze(0).to(device)
     mask = torch.ones(1, tensor.shape[1], dtype=torch.bool, device=device)
     with torch.no_grad():
-        probability = float(torch.sigmoid(model(tensor, mask)).item())
-    threshold = float(config.get("decision_threshold", 0.5))
-    label = int(probability >= threshold)
-    label_name = "CHEAT" if label else "NORMAL"
-    print(
-        f"Prediction: {label_name} "
-        f"(score={probability:.4f}, threshold={threshold:.2f}, events={len(scaled)})"
-    )
-    return {"label": label, "label_name": label_name, "prob": probability}
+        score = float(torch.sigmoid(model(tensor, mask)).item())
+    threshold = float(config["decision_threshold"])
+    pred_label = int(score >= threshold)
+    result = {
+        "session_id": record.get("session_id", input_path.stem),
+        "risk_score": score,
+        "pred_label": pred_label,
+        "threshold": threshold,
+        "n_events": len(scaled),
+    }
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return result
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="TaskTracker -> Mamba -> PasteTrace")
+    parser = argparse.ArgumentParser(description="TaskTracker-only Mamba risk classifier")
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    train_parser = subparsers.add_parser("train", help="Train/validate on TaskTracker")
+    train_parser = subparsers.add_parser("train", help="Train and select threshold on validation")
     train_parser.add_argument("--d-model", type=int, default=D_MODEL)
     train_parser.add_argument("--n-layers", type=int, default=N_LAYERS)
     train_parser.add_argument("--dropout", type=float, default=DROPOUT)
@@ -639,14 +614,10 @@ def main() -> None:
     train_parser.add_argument("--patience", type=int, default=PATIENCE)
     train_parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     train_parser.add_argument("--max-len", type=int, default=MAX_LEN)
-    train_parser.add_argument(
-        "--train-all",
-        action="store_true",
-        help="Train on all TaskTracker sessions; disable validation/early stopping",
-    )
-
-    subparsers.add_parser("test", help="Evaluate frozen model on PasteTrace")
-    predict_parser = subparsers.add_parser("predict", help="Predict one normalized JSON")
+    train_parser.add_argument("--seed", type=int, default=42)
+    test_parser = subparsers.add_parser("test", help="Evaluate once on held-out TaskTracker test")
+    test_parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    predict_parser = subparsers.add_parser("predict", help="Predict one unlabeled normalized JSON")
     predict_parser.add_argument("input")
 
     args = parser.parse_args()

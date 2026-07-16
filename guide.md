@@ -322,17 +322,22 @@ Hoặc dùng UI: chọn folder mới → hệ thống nhận diện PREDICT mode
 
 ### Mamba data flow
 
-Mamba dùng `tasktracker/normalized/` để train/validation và dùng
-`pastetrace/normalized/` làm external test. Hai bộ dữ liệu được build riêng vào
-`data/mamba/train_sequences/` và `data/mamba/test_sequences/`; scaler chỉ fit
-trên TaskTracker train split.
+Mamba chỉ dùng 470 session TaskTracker. Input chuẩn là
+`data/normalized/tasktracker/` (có legacy fallback `tasktracker/normalized/`).
+Các session được build vào `data/mamba/sequences/`, sau đó chia theo participant
+group thành 70% train, 15% validation và 15% held-out test. Scaler chỉ fit train;
+checkpoint và threshold chỉ chọn trên validation.
 
 ```bash
-python -m src.data.build_sequences --train-dir tasktracker --test-dir pastetrace --min-events 1
-python -m src.data.make_splits --val 0.15 --seed 42
-python -m src.models.mamba_model train --train-all
+python -m src.data.build_sequences --min-events 1
+python -m src.data.make_splits --train 0.70 --validation 0.15 --test 0.15 --seed 42
+python -m src.models.mamba_model train --epochs 80 --patience 10 --seed 42
 python -m src.models.mamba_model test
 ```
+
+Output so sánh chuẩn nằm tại `results/mamba/predictions.csv` và
+`results/mamba/metrics.json`. Nhãn TaskTracker là weak behavioral-risk label,
+không phải bằng chứng gian lận đã xác nhận.
 
 ---
 

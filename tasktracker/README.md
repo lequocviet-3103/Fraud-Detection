@@ -21,11 +21,13 @@ tasktracker/
 
 ## File dung de train
 
-Model IF + XGBoost + SHAP va Mamba deu doc tu:
+Input chuan cua cac model la:
 
 ```text
-tasktracker/normalized/
+data/normalized/tasktracker/
 ```
+
+Du an hien van chap nhan `tasktracker/normalized/` nhu legacy fallback cho Mamba.
 
 Trong do:
 
@@ -101,11 +103,11 @@ Trich feature cho IF + XGBoost + SHAP:
   --features-only
 ```
 
-Build sequence cho Mamba (TaskTracker train/validation, PasteTrace external test):
+Build sequence va shared split cho Mamba (TaskTracker-only):
 
 ```powershell
 .\venv\Scripts\python.exe -m src.data.build_sequences `
-  --train-dir tasktracker `
-  --test-dir pastetrace `
+  --input-dir tasktracker `
   --min-events 1
+.\venv\Scripts\python.exe -m src.data.make_splits --seed 42
 ```
