@@ -52,7 +52,10 @@ with st.sidebar:
     st.header("Pipeline status")
     status = {
         "TaskTracker sequences": INDEX_PATH.is_file(),
-        "Shared 70/15/15 splits": (SPLIT_DIR / "manifest.json").is_file(),
+        "Fixed group split CSVs": all(
+            (SPLIT_DIR / f"{name}.csv").is_file()
+            for name in ("train", "validation", "test")
+        ),
         "Mamba checkpoint": (MODEL_DIR / "mamba.pt").is_file(),
         "Test predictions": (RESULTS_DIR / "predictions.csv").is_file(),
         "Test metrics": (RESULTS_DIR / "metrics.json").is_file(),
@@ -100,14 +103,10 @@ with data_tab:
         c1.metric("Sessions", len(frame))
         c2.metric("Participants/groups", frame["group_id"].nunique())
         c3.metric("Risk label=1", int((frame["label"] == 1).sum()))
-        if st.button("Create shared grouped 70/15/15 splits"):
-            output, code = run_command(["-m", "src.data.make_splits", "--seed", "42"])
+        if st.button("Validate fixed group split CSVs"):
+            output, code = run_command(["-m", "src.data.make_splits"])
             st.code(output, language="text")
-            st.success("Shared splits created.") if code == 0 else st.error("Split failed.")
-
-    manifest = load_json(SPLIT_DIR / "manifest.json")
-    if manifest:
-        st.json(manifest)
+            st.success("Fixed splits are valid; no file changed.") if code == 0 else st.error("Fixed split validation failed.")
 
 with train_tab:
     st.subheader("Train on train split; select checkpoint and threshold on validation")

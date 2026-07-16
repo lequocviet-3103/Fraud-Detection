@@ -330,7 +330,7 @@ checkpoint và threshold chỉ chọn trên validation.
 
 ```bash
 python -m src.data.build_sequences --min-events 1
-python -m src.data.make_splits --train 0.70 --validation 0.15 --test 0.15 --seed 42
+python -m src.data.make_splits  # validate fixed group CSVs; khong tao split moi
 python -m src.models.mamba_model train --epochs 80 --patience 10 --seed 42
 python -m src.models.mamba_model test
 ```

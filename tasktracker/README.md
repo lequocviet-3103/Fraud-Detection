@@ -109,5 +109,5 @@ Build sequence va shared split cho Mamba (TaskTracker-only):
 .\venv\Scripts\python.exe -m src.data.build_sequences `
   --input-dir tasktracker `
   --min-events 1
-.\venv\Scripts\python.exe -m src.data.make_splits --seed 42
+.\venv\Scripts\python.exe -m src.data.make_splits  # chi validate split co dinh
 ```

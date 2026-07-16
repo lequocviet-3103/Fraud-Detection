@@ -12,9 +12,10 @@ data/splits/tasktracker/test.csv
 ```
 
 The participant-specific suffix of `session_id` is the grouping key. Sessions
-with the same key cannot cross splits. The supplied seed-42 split contains 326
-train, 71 validation, and 73 test sessions. Small deviations from exact 70/15/15
-are expected because participant groups cannot be divided.
+with the same key cannot cross splits. These three files are supplied by the
+research group and are never generated or rewritten by Mamba. The official test
+file must contain exactly 69 sessions: 15 label 1 and 54 label 0. Mamba exits
+with an error when that contract is not satisfied.
 
 TaskTracker labels are weak behavioral-risk labels:
 
@@ -79,16 +80,19 @@ largest paste size, and session duration. `risk_score` is the sigmoid model
 decision score in `[0,1]`; it is not a calibrated probability.
 
 `metrics.json` contains every shared comparison field: `n_test_sessions`,
-`threshold`, `precision`, `recall`, `f1`, `auc`, `balanced_accuracy`, `tp`, `tn`,
-`fp`, `fn`, `train_runtime_sec`, and `inference_runtime_sec`. Mamba additionally
+`threshold`, `precision`, `recall`, `f1`, `auc`, `pr_auc`, `balanced_accuracy`,
+`specificity`, `tp`, `tn`, `fp`, `fn`, runtimes, `model_size_mb`, and
+`random_state`. Mamba additionally
 records architecture, input features, test loss, normal-class metrics, selected
-epoch, validation F1, label warning, and the split manifest.
+epoch, validation F1, package versions, device, parameter count, peak memory,
+label warning, and hashes of the fixed split CSV files.
 
 ## Mamba-specific trace outputs
 
 ```text
 results/mamba/training_history.csv
 results/mamba/validation_predictions.csv
+results/mamba/method.json
 models/mamba/mamba.pt
 models/mamba/scaler.json
 models/mamba/config.json
@@ -98,5 +102,7 @@ models/mamba/config.json
   threshold considered at every epoch.
 - `validation_predictions.csv`: evidence that threshold selection used only the
   validation split.
+- `method.json`: package versions, exact feature formulas, preprocessing,
+  architecture, training policy, hardware, parameter count, and peak memory.
 - `config.json`: architecture, selected threshold, runtime, weak-label type,
   seed, and exact split manifest needed for reproducibility.

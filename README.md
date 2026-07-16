@@ -5,7 +5,7 @@ Ket hop hai nhanh: phan tich **code text** (CodeBERT) va phan tich **hanh vi go 
 
 ---
 
-## Mamba: TaskTracker-only, shared 70/15/15 split
+## Mamba: TaskTracker-only, fixed group split
 
 Nhanh Mamba chi dung 470 session TaskTracker. PasteTrace khong con la input train,
 validation hay test cua Mamba. Input chuan la `data/normalized/tasktracker/`;
@@ -21,7 +21,7 @@ Chay CLI:
 
 ```bash
 python -m src.data.build_sequences --min-events 1
-python -m src.data.make_splits --train 0.70 --validation 0.15 --test 0.15 --seed 42
+python -m src.data.make_splits  # chi validate 3 CSV co dinh, khong tao split
 python -m src.models.mamba_model train --epochs 80 --patience 10 --lr 3e-4 --batch-size 8 --seed 42
 python -m src.models.mamba_model test
 ```
@@ -41,13 +41,13 @@ data/mamba/index.csv                           # session/label/group index
 data/splits/tasktracker/train.csv              # shared split
 data/splits/tasktracker/validation.csv
 data/splits/tasktracker/test.csv
-data/splits/tasktracker/manifest.json          # counts + leakage audit
 models/mamba/mamba.pt
 models/mamba/config.json                       # threshold + architecture
 results/mamba/predictions.csv                  # common comparison schema
 results/mamba/metrics.json                     # common comparison metrics
 results/mamba/validation_predictions.csv       # Mamba threshold audit
 results/mamba/training_history.csv              # loss/F1 per epoch
+results/mamba/method.json                       # package + methodology + hardware
 ```
 
 Dashboard rieng cho Mamba:
@@ -59,8 +59,8 @@ streamlit run src/ui/mamba_app.py
 Notebook GPU: `notebooks/mamba_colab.ipynb`.
 
 Bon cot dau cua `predictions.csv` la `session_id,true_label,risk_score,pred_label`.
-`metrics.json` co cac field so sanh chung: precision, recall, f1, auc,
-balanced_accuracy, TP/TN/FP/FN, train runtime va inference runtime. Cac field Mamba
+`metrics.json` co cac field so sanh chung: precision, recall, f1, auc, pr_auc,
+balanced_accuracy, specificity, TP/TN/FP/FN, runtime va model size. Cac field Mamba
 bo sung duoc mo ta day du trong `MAMBA_IO.md`.
 
 ---
