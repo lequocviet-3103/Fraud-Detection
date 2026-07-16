@@ -15,6 +15,9 @@ validation hay test cua Mamba. Input chuan la `data/normalized/tasktracker/`;
 - `data/splits/tasktracker/validation.csv`: chon checkpoint va threshold.
 - `data/splits/tasktracker/test.csv`: danh gia cuoi cung mot lan.
 - Cac session co cung participant/group id luon nam trong cung mot split.
+- Hop dong bat buoc: train `333 sessions/191 groups`, validation
+  `68 sessions/37 groups`, test `69 sessions/43 groups`; test gom 15 risk va
+  54 normal.
 - Nhan TaskTracker la weak behavioral-risk label, khong phai bang chung cheating.
 
 Chay CLI:
@@ -48,6 +51,9 @@ results/mamba/metrics.json                     # common comparison metrics
 results/mamba/validation_predictions.csv       # Mamba threshold audit
 results/mamba/training_history.csv              # loss/F1 per epoch
 results/mamba/method.json                       # package + methodology + hardware
+results/mamba/splits/train.csv                  # exact split copies actually read
+results/mamba/splits/validation.csv
+results/mamba/splits/test.csv
 ```
 
 Dashboard rieng cho Mamba:

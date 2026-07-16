@@ -13,7 +13,11 @@ from pathlib import Path
 
 INDEX_PATH = Path("data") / "mamba" / "index.csv"
 SPLIT_DIR = Path("data") / "splits" / "tasktracker"
-EXPECTED_TEST = {"sessions": 69, "risk_1": 15, "normal_0": 54}
+EXPECTED_SPLITS = {
+    "train": {"sessions": 333, "groups": 191},
+    "validation": {"sessions": 68, "groups": 37},
+    "test": {"sessions": 69, "groups": 43, "risk_1": 15, "normal_0": 54},
+}
 
 
 def _read_rows(path: Path, key: str) -> list[str]:
@@ -64,9 +68,14 @@ def validate_fixed_splits(index_path: Path, split_dir: Path) -> dict:
             "normal_0": labels.count(0),
             "groups": len(group_sets[name]),
         }
-    actual_test = {key: counts["test"][key] for key in EXPECTED_TEST}
-    if actual_test != EXPECTED_TEST:
-        raise ValueError(f"Official test must be {EXPECTED_TEST}; found {actual_test}")
+    for name, expected in EXPECTED_SPLITS.items():
+        actual = {key: counts[name][key] for key in expected}
+        if actual != expected:
+            raise ValueError(
+                f"Official {name} split must be {expected}; found {actual}. "
+                "Replace all three CSV files with the files supplied by the group; "
+                "do not regenerate them."
+            )
     return counts
 
 

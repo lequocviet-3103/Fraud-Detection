@@ -13,9 +13,17 @@ data/splits/tasktracker/test.csv
 
 The participant-specific suffix of `session_id` is the grouping key. Sessions
 with the same key cannot cross splits. These three files are supplied by the
-research group and are never generated or rewritten by Mamba. The official test
-file must contain exactly 69 sessions: 15 label 1 and 54 label 0. Mamba exits
-with an error when that contract is not satisfied.
+research group and are never generated or rewritten by Mamba. The exact split
+contract is:
+
+| Split | Sessions | Groups |
+|---|---:|---:|
+| Train | 333 | 191 |
+| Validation | 68 | 37 |
+| Test | 69 | 43 |
+
+The test file must contain 15 label 1 and 54 label 0. Mamba exits with an error
+when any count, group count, overlap check, or test-label count is not satisfied.
 
 TaskTracker labels are weak behavioral-risk labels:
 
@@ -87,6 +95,17 @@ records architecture, input features, test loss, normal-class metrics, selected
 epoch, validation F1, package versions, device, parameter count, peak memory,
 label warning, and hashes of the fixed split CSV files.
 
+Byte-for-byte copies of the three inputs actually read are also saved:
+
+```text
+results/mamba/splits/train.csv
+results/mamba/splits/validation.csv
+results/mamba/splits/test.csv
+```
+
+Their SHA-256 hashes and counts are recorded in both `metrics.json` and
+`method.json`.
+
 ## Mamba-specific trace outputs
 
 ```text
@@ -106,3 +125,21 @@ models/mamba/config.json
   architecture, training policy, hardware, parameter count, and peak memory.
 - `config.json`: architecture, selected threshold, runtime, weak-label type,
   seed, and exact split manifest needed for reproducibility.
+
+## Architecture details
+
+The seven features of each event are projected independently from 7 to
+`d_model=64` by `torch.nn.Linear(7, 64, bias=True)`. Each Mamba block uses a
+pre-normalized residual connection:
+
+```text
+x = x + Mamba(LayerNorm(x))
+```
+
+Every block owns a separate `torch.nn.LayerNorm(64)`. There is no additional
+LayerNorm after the Mamba stack. Masked mean and masked max pooling are
+concatenated, followed by dropout and `Linear(128, 1)`.
+
+Runtime values describe the recorded hardware (for example Tesla T4) only. They
+must not be used for a direct speed comparison with a model timed on different
+hardware.

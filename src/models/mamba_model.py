@@ -18,6 +18,7 @@ import hashlib
 import json
 import platform
 import random
+import shutil
 import time
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
@@ -56,7 +57,12 @@ MAX_LEN = 1000
 D_STATE = 16
 D_CONV = 4
 EXPAND = 2
-EXPECTED_TEST_SESSIONS = 69
+EXPECTED_SPLIT_SHAPES = {
+    "train": {"sessions": 333, "groups": 191},
+    "validation": {"sessions": 68, "groups": 37},
+    "test": {"sessions": 69, "groups": 43},
+}
+EXPECTED_TEST_SESSIONS = EXPECTED_SPLIT_SHAPES["test"]["sessions"]
 EXPECTED_TEST_RISK = 15
 EXPECTED_TEST_NORMAL = 54
 
@@ -311,22 +317,6 @@ def _required_inputs(
     )
     if group_overlap:
         raise SystemExit("[ERROR] Participant/group leakage found across splits.")
-    if len(splits["test"]) != EXPECTED_TEST_SESSIONS:
-        raise SystemExit(
-            "[ERROR] Official test split mismatch: expected 69 session IDs, found "
-            f"{len(splits['test'])}. "
-            "Replace the three split CSV files with the fixed group split; "
-            "do not regenerate them."
-        )
-    if validate_test_labels:
-        test_labels = [int(index[session]["label"]) for session in splits["test"]]
-        test_risk = test_labels.count(1)
-        test_normal = test_labels.count(0)
-        if test_risk != EXPECTED_TEST_RISK or test_normal != EXPECTED_TEST_NORMAL:
-            raise SystemExit(
-                "[ERROR] Official test label mismatch: expected risk=1: 15 and "
-                f"normal=0: 54; found risk=1: {test_risk}, normal=0: {test_normal}."
-            )
     counts = {}
     for name, sessions in splits.items():
         labels = (
@@ -340,6 +330,22 @@ def _required_inputs(
             "normal_0": labels.count(0) if labels else None,
             "groups": len(group_sets[name]),
         }
+    for name, expected in EXPECTED_SPLIT_SHAPES.items():
+        actual = {key: counts[name][key] for key in expected}
+        if actual != expected:
+            raise SystemExit(
+                f"[ERROR] Official {name} split mismatch: expected {expected}, "
+                f"found {actual}. Replace all three CSV files in {SPLIT_DIR} "
+                "with the fixed files supplied by the group; do not regenerate them."
+            )
+    if validate_test_labels:
+        test_risk = counts["test"]["risk_1"]
+        test_normal = counts["test"]["normal_0"]
+        if test_risk != EXPECTED_TEST_RISK or test_normal != EXPECTED_TEST_NORMAL:
+            raise SystemExit(
+                "[ERROR] Official test label mismatch: expected risk=1: 15 and "
+                f"normal=0: 54; found risk=1: {test_risk}, normal=0: {test_normal}."
+            )
     manifest = {
         "dataset": "tasktracker",
         "label_type": "weak_behavioral_risk",
@@ -352,6 +358,47 @@ def _required_inputs(
         },
     }
     return splits, index, manifest
+
+
+def _copy_split_inputs(manifest: dict) -> dict[str, dict[str, str | int]]:
+    """Archive byte-for-byte copies of the split CSVs used for evaluation."""
+    destination = RESULTS_DIR / "splits"
+    destination.mkdir(parents=True, exist_ok=True)
+    copies: dict[str, dict[str, str | int]] = {}
+    for name in ("train", "validation", "test"):
+        source = SPLIT_DIR / f"{name}.csv"
+        saved_copy = destination / f"{name}.csv"
+        shutil.copy2(source, saved_copy)
+        copied_hash = _sha256(saved_copy)
+        expected_hash = manifest["split_sha256"][name]
+        if copied_hash != expected_hash:
+            raise SystemExit(f"[ERROR] Split copy hash mismatch for {name}.csv")
+        copies[name] = {
+            "source": str(source),
+            "saved_copy": str(saved_copy),
+            "sha256": copied_hash,
+            "sessions": int(manifest["counts"][name]["sessions"]),
+            "groups": int(manifest["counts"][name]["groups"]),
+        }
+    return copies
+
+
+def _verify_checkpoint_split_manifest(config: dict, current_manifest: dict) -> None:
+    """Prevent evaluating a checkpoint trained with different split files."""
+    trained_manifest = config.get("split_manifest")
+    if not isinstance(trained_manifest, dict):
+        raise SystemExit(
+            "[ERROR] Model config has no training split manifest; retrain Mamba with "
+            "the official fixed split files."
+        )
+    trained_hashes = trained_manifest.get("split_sha256")
+    current_hashes = current_manifest.get("split_sha256")
+    if trained_hashes != current_hashes:
+        raise SystemExit(
+            "[ERROR] The checkpoint was trained with different split CSV files. "
+            "Replace the CSVs with the official group files, then rerun train and test. "
+            f"Training hashes={trained_hashes}; current hashes={current_hashes}."
+        )
 
 
 def _make_loader(dataset, batch_size: int, shuffle: bool):
@@ -533,6 +580,10 @@ def cmd_train(args: argparse.Namespace) -> None:
         "n_features": n_features,
         "feature_names": FEATURE_NAMES,
         "d_model": args.d_model,
+        "input_projection": (
+            f"torch.nn.Linear(in_features={n_features}, out_features={args.d_model}, "
+            "bias=True), applied independently to every event"
+        ),
         "n_layers": args.n_layers,
         "d_state": D_STATE,
         "d_conv": D_CONV,
@@ -552,6 +603,11 @@ def cmd_train(args: argparse.Namespace) -> None:
         "epochs_completed": len(history),
         "stopped_reason": stopped_reason,
         "pooling": "masked_mean_plus_max",
+        "block_normalization": (
+            "pre-norm residual in every block: x = x + Mamba(LayerNorm(x)); "
+            "each block has its own torch.nn.LayerNorm(d_model); no additional "
+            "LayerNorm after the block stack"
+        ),
         "classification_head": "concat(masked_mean, masked_max) -> dropout -> Linear(2*d_model, 1)",
         "optimizer": "AdamW",
         "learning_rate": args.lr,
@@ -589,6 +645,10 @@ def cmd_train(args: argparse.Namespace) -> None:
         "n_validation_sessions": len(validation_ids),
         "n_test_sessions_held_out": len(splits["test"]),
         "train_runtime_sec": train_runtime,
+        "runtime_comparison_note": (
+            "Runtime is descriptive for the recorded hardware only; do not compare "
+            "speed directly with a model measured on different hardware."
+        ),
         "split_manifest": manifest,
     }
     with (MODEL_DIR / "config.json").open("w", encoding="utf8") as handle:
@@ -652,6 +712,7 @@ def cmd_test(args: argparse.Namespace) -> None:
     test_ids = splits["test"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, scaler, config = _load_model_and_scaler(device)
+    _verify_checkpoint_split_manifest(config, manifest)
     test_dataset = SequenceDataset(test_ids, str(SEQUENCE_DIR), scaler, int(config["max_len"]))
     test_loader = _make_loader(test_dataset, args.batch_size, False)
     criterion = nn.BCEWithLogitsLoss()
@@ -729,11 +790,13 @@ def cmd_test(args: argparse.Namespace) -> None:
             "truncation": config["truncation"],
             "empty_session_policy": config["empty_session_policy"],
             "d_model": config["d_model"],
+            "input_projection": config["input_projection"],
             "n_layers": config["n_layers"],
             "d_state": config["d_state"],
             "d_conv": config["d_conv"],
             "expand": config["expand"],
             "dropout": config["dropout"],
+            "block_normalization": config["block_normalization"],
             "pooling": config["pooling"],
             "classification_head": config["classification_head"],
             "optimizer": config["optimizer"],
@@ -749,6 +812,7 @@ def cmd_test(args: argparse.Namespace) -> None:
         },
         "score_definition": "risk_score = sigmoid(model_logit), in [0,1], not calibrated probability",
         "label_note": "Weak behavioral-risk label; not confirmed evidence of cheating.",
+        "runtime_comparison_note": config["runtime_comparison_note"],
         "split_manifest": manifest,
     }
     rows = _prediction_rows(
@@ -759,6 +823,8 @@ def cmd_test(args: argparse.Namespace) -> None:
             "[ERROR] Prediction output does not exactly match the ordered official test.csv."
         )
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    split_files_used = _copy_split_inputs(manifest)
+    metrics["split_files_used"] = split_files_used
     predictions_path = RESULTS_DIR / "predictions.csv"
     metrics_path = RESULTS_DIR / "metrics.json"
     method_path = RESULTS_DIR / "method.json"
@@ -777,6 +843,9 @@ def cmd_test(args: argparse.Namespace) -> None:
         "model_size_mb": metrics["model_size_mb"],
         "train_peak_memory_mb": metrics["train_peak_memory_mb"],
         "inference_peak_memory_mb": metrics["inference_peak_memory_mb"],
+        "runtime_comparison_note": metrics["runtime_comparison_note"],
+        "split_manifest": metrics["split_manifest"],
+        "split_files_used": split_files_used,
         **metrics["mamba_method"],
     }
     with method_path.open("w", encoding="utf8") as handle:
@@ -795,6 +864,7 @@ def cmd_test(args: argparse.Namespace) -> None:
     print(f"Predictions        : {predictions_path}")
     print(f"Metrics            : {metrics_path}")
     print(f"Method             : {method_path}")
+    print(f"Split copies       : {RESULTS_DIR / 'splits'}")
 
 
 def cmd_predict(args: argparse.Namespace) -> dict:
